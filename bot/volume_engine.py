@@ -1,21 +1,28 @@
 """
 Volume Trading Engine
-取引量を稼ぐためのボット
+取引量を稼ぐためのエンジン
 """
 
 import asyncio
 from decimal import Decimal
-from typing import Optional
-from datetime import datetime
 from loguru import logger
 
-from bot.models.types import OrderSide, OrderRequest, OrderType, TimeInForce
 from bot.adapters.base import ExchangeAdapter
+from bot.models.types import OrderRequest, OrderSide, OrderType, TimeInForce
 
 
 class VolumeEngine:
-    """取引量稼ぎエンジン"""
+    """取引量を稼ぐためのエンジン
     
+    動作:
+    1. エントリー: 現在価格の上下にMAKER注文を配置
+    2. 約定待機: どちらかの注文が約定するまで待つ
+    3. ポジション保持: 指定時間（デフォルト120秒）ポジションを保持
+    4. エグジット: ポジションを決済
+    5. 待機: 指定時間（デフォルト60秒）待機
+    6. 1に戻る
+    """
+
     def __init__(
         self,
         adapter: ExchangeAdapter,
@@ -29,185 +36,200 @@ class VolumeEngine:
         self.adapter = adapter
         self.contract_id = contract_id
         self.size = size
-        self.entry_offset = entry_offset_usd
-        self.exit_offset = exit_offset_usd
-        self.hold_time = hold_time_seconds
-        self.reorder_interval = reorder_interval_seconds
+        self.entry_offset_usd = entry_offset_usd
+        self.exit_offset_usd = exit_offset_usd
+        self.hold_time_seconds = hold_time_seconds
+        self.reorder_interval_seconds = reorder_interval_seconds
         
-        self.position_size = Decimal("0")
-        self.entry_price: Optional[Decimal] = None
-        self.entry_time: Optional[datetime] = None
-        self.buy_order_id: Optional[str] = None
-        self.sell_order_id: Optional[str] = None
+        # 状態管理
+        self.position_side: str | None = None  # "LONG" or "SHORT"
+        self.position_size: Decimal = Decimal("0")
+        self.position_price: Decimal = Decimal("0")
+        self.total_volume: Decimal = Decimal("0")
+        self.total_pnl: Decimal = Decimal("0")
+        self.cycle_count: int = 0
         
-        self.total_volume = Decimal("0")
-        self.total_pnl = Decimal("0")
-        self.cycle_count = 0
-        
+        # 注文ID
+        self.buy_order_id: str | None = None
+        self.sell_order_id: str | None = None
+
     async def run(self):
-        logger.info("volume engine started: contract_id={} size={} entry_offset={} exit_offset={} hold_time={}s",
-                   self.contract_id, self.size, self.entry_offset, self.exit_offset, self.hold_time)
-        
+        """メインループ"""
         await self.adapter.connect()
+        logger.info("=== 取引量ボット起動 ===")
+        logger.info("契約ID: {}", self.contract_id)
+        logger.info("サイズ: {} BTC", self.size)
+        logger.info("エントリーオフセット: {} USD", self.entry_offset_usd)
+        logger.info("エグジットオフセット: {} USD", self.exit_offset_usd)
+        logger.info("ポジション保持時間: {} 秒", self.hold_time_seconds)
+        logger.info("サイクル間隔: {} 秒", self.reorder_interval_seconds)
         
         try:
             while True:
-                try:
-                    if self.position_size == 0:
-                        await self._entry_phase()
-                    else:
-                        await self._exit_phase()
-                except Exception as e:
-                    logger.error("volume engine error: {}", e)
-                    await asyncio.sleep(5)
+                await self._entry_phase()
+                await self._hold_phase()
+                await self._exit_phase()
+                
+                logger.info("=== サイクル完了 ===")
+                logger.info("待機時間: {} 秒", self.reorder_interval_seconds)
+                await asyncio.sleep(self.reorder_interval_seconds)
+                
         finally:
             await self.adapter.close()
-    
-    async def _is_order_filled(self, order_id: str) -> bool:
-        """注文が約定したかチェック（アクティブな注文リストから消えたら約定）"""
-        try:
-            active_orders = await self.adapter.list_active_orders(self.contract_id)
-            for order in active_orders:
-                oid = order.get("orderId") or order.get("id")
-                if str(oid) == str(order_id):
-                    # まだアクティブ = 未約定
-                    return False
-            # アクティブリストにない = 約定済み
-            return True
-        except Exception as e:
-            logger.debug("failed to check order status: {}", e)
-            return False
-    
+            logger.info("取引量ボット停止")
+
     async def _entry_phase(self):
-        logger.info("=== ENTRY PHASE ===")
+        """エントリーフェーズ: 両建て注文を発注"""
+        logger.info("=== エントリーフェーズ ===")
         
-        ticker = await self.adapter.get_ticker(self.contract_id)
-        mid_price = Decimal(str(ticker.price))
-        logger.info("current price: {}", mid_price)
+        # 現在価格を取得
+        current_price = await self.adapter.get_mid_price(self.contract_id)
+        logger.info("現在価格: ${:.1f}", current_price)
         
-        buy_price = mid_price - self.entry_offset
-        sell_price = mid_price + self.entry_offset
+        # エントリー価格を計算
+        buy_price = float(Decimal(str(current_price)) - self.entry_offset_usd)
+        sell_price = float(Decimal(str(current_price)) + self.entry_offset_usd)
+        logger.info("エントリー注文配置: 買い=${:.1f} 売り=${:.1f}", buy_price, sell_price)
         
-        logger.info("placing entry orders: buy={} sell={}", buy_price, sell_price)
-        
+        # 買い注文
         buy_order_req = OrderRequest(
             symbol=self.contract_id,
             side=OrderSide.BUY,
             type=OrderType.LIMIT,
             quantity=self.size,
             price=buy_price,
-            time_in_force=TimeInForce.POST_ONLY  # ← 追加：MAKER専用
+            time_in_force=TimeInForce.POST_ONLY  # ← MAKER注文（手数料リベート）
         )
-        buy_order = await self.adapter.place_order(buy_order_req)
-        self.buy_order_id = buy_order.id
         
+        # 売り注文
         sell_order_req = OrderRequest(
             symbol=self.contract_id,
             side=OrderSide.SELL,
             type=OrderType.LIMIT,
             quantity=self.size,
             price=sell_price,
-            time_in_force=TimeInForce.POST_ONLY  # ← 追加：MAKER専用
+            time_in_force=TimeInForce.POST_ONLY  # ← MAKER注文（手数料リベート）
         )
+        
+        # 注文を発注
+        buy_order = await self.adapter.place_order(buy_order_req)
         sell_order = await self.adapter.place_order(sell_order_req)
+        
+        self.buy_order_id = buy_order.id
         self.sell_order_id = sell_order.id
         
-        logger.info("entry orders placed: buy_id={} sell_id={}", self.buy_order_id, self.sell_order_id)
+        logger.info("エントリー注文発注完了: 買いID={} 売りID={}", self.buy_order_id, self.sell_order_id)
         
+        # 約定待機
+        logger.info("約定待機中...")
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             
-            buy_filled = await self._is_order_filled(self.buy_order_id)
-            if buy_filled:
-                logger.info("BUY order filled! price={}", buy_price)
-                await self.adapter.cancel_order(self.sell_order_id)
-                self.sell_order_id = None
+            # アクティブ注文を確認
+            active_orders = await self.adapter.list_active_orders(self.contract_id)
+            active_ids = {o.id for o in active_orders}
+            
+            # 買い注文が約定したか確認
+            if self.buy_order_id not in active_ids:
+                logger.info("買い注文約定! 価格=${:.1f}", buy_price)
+                self.position_side = "LONG"
                 self.position_size = self.size
-                self.entry_price = buy_price
-                self.entry_time = datetime.now()
-                logger.info("position: LONG {} @ {}", self.position_size, self.entry_price)
-                break
-            
-            sell_filled = await self._is_order_filled(self.sell_order_id)
-            if sell_filled:
-                logger.info("SELL order filled! price={}", sell_price)
-                await self.adapter.cancel_order(self.buy_order_id)
-                self.buy_order_id = None
-                self.position_size = -self.size
-                self.entry_price = sell_price
-                self.entry_time = datetime.now()
-                logger.info("position: SHORT {} @ {}", abs(self.position_size), self.entry_price)
-                break
-        
-        self.total_volume += self.size
-        logger.info("total volume: {}", self.total_volume)
-    
-    async def _exit_phase(self):
-        elapsed = (datetime.now() - self.entry_time).total_seconds()
-        if elapsed < self.hold_time:
-            wait_time = self.hold_time - elapsed
-            logger.info("holding position... wait {}s", int(wait_time))
-            await asyncio.sleep(min(wait_time, 10))
-            return
-        
-        logger.info("=== EXIT PHASE ===")
-        logger.info("hold time reached, starting exit process")
-        
-        while self.position_size != 0:
-            ticker = await self.adapter.get_ticker(self.contract_id)
-            mid_price = Decimal(str(ticker.price))
-            
-            if self.position_size > 0:
-                exit_price = mid_price + self.exit_offset
-                logger.info("placing exit SELL order: price={}", exit_price)
-                exit_order_req = OrderRequest(
-                    symbol=self.contract_id,
-                    side=OrderSide.SELL,
-                    type=OrderType.LIMIT,
-                    quantity=abs(self.position_size),
-                    price=exit_price,
-                    time_in_force=TimeInForce.POST_ONLY  # ← 追加：MAKER専用
-                )
-            else:
-                exit_price = mid_price - self.exit_offset
-                logger.info("placing exit BUY order: price={}", exit_price)
-                exit_order_req = OrderRequest(
-                    symbol=self.contract_id,
-                    side=OrderSide.BUY,
-                    type=OrderType.LIMIT,
-                    quantity=abs(self.position_size),
-                    price=exit_price,
-                    time_in_force=TimeInForce.POST_ONLY  # ← 追加：MAKER専用
-                )
-            
-            exit_order = await self.adapter.place_order(exit_order_req)
-            exit_order_id = exit_order.id
-            
-            for _ in range(self.reorder_interval):
-                await asyncio.sleep(1)
+                self.position_price = Decimal(str(buy_price))
+                self.total_volume += self.size
                 
-                if await self._is_order_filled(exit_order_id):
-                    logger.info("EXIT order filled! price={}", exit_price)
-                    
-                    if self.position_size > 0:
-                        pnl = (exit_price - self.entry_price) * self.size
-                    else:
-                        pnl = (self.entry_price - exit_price) * self.size
-                    
-                    self.total_pnl += pnl
-                    self.total_volume += abs(self.position_size)
-                    self.cycle_count += 1
-                    
-                    logger.info("position closed: pnl={} total_pnl={} total_volume={} cycles={}",
-                               pnl, self.total_pnl, self.total_volume, self.cycle_count)
-                    
-                    self.position_size = Decimal("0")
-                    self.entry_price = None
-                    self.entry_time = None
-                    return
+                # 売り注文をキャンセル
+                if self.sell_order_id in active_ids:
+                    await self.adapter.cancel_order(self.sell_order_id)
+                    logger.info("売り注文キャンセル: ID={}", self.sell_order_id)
+                break
             
-            logger.info("exit order not filled, cancelling and reordering...")
-            try:
-                await self.adapter.cancel_order(exit_order_id)
-            except Exception as e:
-                logger.debug("cancel failed (maybe already filled): {}", e)
+            # 売り注文が約定したか確認
+            if self.sell_order_id not in active_ids:
+                logger.info("売り注文約定! 価格=${:.1f}", sell_price)
+                self.position_side = "SHORT"
+                self.position_size = -self.size
+                self.position_price = Decimal(str(sell_price))
+                self.total_volume += self.size
+                
+                # 買い注文をキャンセル
+                if self.buy_order_id in active_ids:
+                    await self.adapter.cancel_order(self.buy_order_id)
+                    logger.info("買い注文キャンセル: ID={}", self.buy_order_id)
+                break
+        
+        logger.info("ポジション: {} {} @ ${:.1f}", self.position_side, self.position_size, self.position_price)
+        logger.info("累計取引量: {} BTC", self.total_volume)
+
+    async def _hold_phase(self):
+        """ホールドフェーズ: ポジションを保持"""
+        logger.info("=== ポジション保持フェーズ ===")
+        logger.info("保持時間: {} 秒", self.hold_time_seconds)
+        
+        for i in range(self.hold_time_seconds, 0, -10):
+            logger.info("ポジション保持中... 残り {} 秒", i)
+            await asyncio.sleep(10)
+
+    async def _exit_phase(self):
+        """エグジットフェーズ: ポジションを決済"""
+        logger.info("=== エグジットフェーズ ===")
+        logger.info("保持時間終了、決済処理開始")
+        
+        # 現在価格を取得
+        current_price = await self.adapter.get_mid_price(self.contract_id)
+        
+        # エグジット価格を計算
+        if self.position_side == "LONG":
+            # ロングポジション → 売りで決済
+            exit_price = float(Decimal(str(current_price)) - self.exit_offset_usd)
+            exit_side = OrderSide.SELL
+            logger.info("決済注文配置（売り）: 価格=${:.1f}", exit_price)
+        else:
+            # ショートポジション → 買いで決済
+            exit_price = float(Decimal(str(current_price)) + self.exit_offset_usd)
+            exit_side = OrderSide.BUY
+            logger.info("決済注文配置（買い）: 価格=${:.1f}", exit_price)
+        
+        # 決済注文
+        exit_order_req = OrderRequest(
+            symbol=self.contract_id,
+            side=exit_side,
+            type=OrderType.LIMIT,
+            quantity=abs(self.position_size),
+            price=exit_price,
+            time_in_force=TimeInForce.POST_ONLY  # ← MAKER注文（手数料リベート）
+        )
+        
+        exit_order = await self.adapter.place_order(exit_order_req)
+        exit_order_id = exit_order.id
+        logger.info("決済注文発注完了: ID={}", exit_order_id)
+        
+        # 約定待機
+        logger.info("決済約定待機中...")
+        while True:
+            await asyncio.sleep(1)
+            
+            # アクティブ注文を確認
+            active_orders = await self.adapter.list_active_orders(self.contract_id)
+            active_ids = {o.id for o in active_orders}
+            
+            # 決済注文が約定したか確認
+            if exit_order_id not in active_ids:
+                logger.info("決済注文約定! 価格=${:.1f}", exit_price)
+                break
+        
+        # PnL計算
+        if self.position_side == "LONG":
+            pnl = (Decimal(str(exit_price)) - self.position_price) * self.position_size
+        else:
+            pnl = (self.position_price - Decimal(str(exit_price))) * abs(self.position_size)
+        
+        self.total_pnl += pnl
+        self.cycle_count += 1
+        
+        logger.info("ポジション決済完了: PnL=${:.3f} 累計PnL=${:.3f} 累計取引量={} BTC サイクル数={}", 
+                   pnl, self.total_pnl, self.total_volume, self.cycle_count)
+        
+        # ポジションをリセット
+        self.position_side = None
+        self.position_size = Decimal("0")
+        self.position_price = Decimal("0")

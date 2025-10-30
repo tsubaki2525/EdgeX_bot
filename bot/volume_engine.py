@@ -9,7 +9,7 @@ from typing import Optional
 from datetime import datetime
 from loguru import logger
 
-from bot.models.types import OrderSide, OrderRequest, OrderType
+from bot.models.types import OrderSide, OrderRequest, OrderType, TimeInForce
 from bot.adapters.base import ExchangeAdapter
 
 
@@ -95,7 +95,8 @@ class VolumeEngine:
             side=OrderSide.BUY,
             type=OrderType.LIMIT,
             quantity=self.size,
-            price=buy_price
+            price=buy_price,
+            time_in_force=TimeInForce.POST_ONLY  # ← 追加：MAKER専用
         )
         buy_order = await self.adapter.place_order(buy_order_req)
         self.buy_order_id = buy_order.id
@@ -105,7 +106,8 @@ class VolumeEngine:
             side=OrderSide.SELL,
             type=OrderType.LIMIT,
             quantity=self.size,
-            price=sell_price
+            price=sell_price,
+            time_in_force=TimeInForce.POST_ONLY  # ← 追加：MAKER専用
         )
         sell_order = await self.adapter.place_order(sell_order_req)
         self.sell_order_id = sell_order.id
@@ -163,7 +165,8 @@ class VolumeEngine:
                     side=OrderSide.SELL,
                     type=OrderType.LIMIT,
                     quantity=abs(self.position_size),
-                    price=exit_price
+                    price=exit_price,
+                    time_in_force=TimeInForce.POST_ONLY  # ← 追加：MAKER専用
                 )
             else:
                 exit_price = mid_price - self.exit_offset
@@ -173,7 +176,8 @@ class VolumeEngine:
                     side=OrderSide.BUY,
                     type=OrderType.LIMIT,
                     quantity=abs(self.position_size),
-                    price=exit_price
+                    price=exit_price,
+                    time_in_force=TimeInForce.POST_ONLY  # ← 追加：MAKER専用
                 )
             
             exit_order = await self.adapter.place_order(exit_order_req)

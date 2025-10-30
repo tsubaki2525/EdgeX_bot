@@ -26,10 +26,6 @@ class GridEngine:
         self,
         adapter: ExchangeAdapter,
         symbol: str,
-        step: float,
-        levels: int,
-        size: float,
-        first_offset: float,
         poll_interval_sec: float = 1.0,
     ) -> None:
         self.adapter = adapter
@@ -75,7 +71,7 @@ class GridEngine:
 
     async def run(self) -> None:
         await self.adapter.connect()
-        self._running = False
+        self._running = True
         logger.info(
             "グリッドエンジン起動: グリッド幅={}USD レベル数={} サイズ={}BTC",
             self.step,
@@ -86,7 +82,7 @@ class GridEngine:
             while self._running:
                 try:
                     self._loop_iter += 1
-                    logger.debug("グリッドループ開始: iter={} 配置済み数=() 配置済みあ数=() 初期化済み={}", 
+                    logger.debug("グリッドループ開始: iter={} 配置済み買い={}本 配置済み売り={}本 初期化済み={}", 
                                 self._loop_iter, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id), self.initialized)
 
                     # 現在価格取得
@@ -106,7 +102,7 @@ class GridEngine:
 
                 except Exception as e:
                     logger.warning("グリッドループエラー: {}", e)
-                    logger.debug("グリッドループ終了: iter={} 配置済み数={}", self._loop_iter, self.poll_interval_sec)
+                    logger.debug("グリッドループ終了: iter={} 待機時間={}秒", self._loop_iter, self.poll_interval_sec)
                     await asyncio.sleep(self.poll_interval_sec)
 
                 # 定期: クローズ損益の新規行を取り込み

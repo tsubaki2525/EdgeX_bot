@@ -1,4 +1,7 @@
-from __future__ import annotations
+"""
+Grid Trading Engine
+グリッド戦略エンジン
+"""
 
 import asyncio
 import os
@@ -7,7 +10,7 @@ import time
 from loguru import logger
 
 from bot.adapters.base import ExchangeAdapter
-from bot.models.types import OrderRequest, OrderSide, OrderType
+from bot.models.types import OrderRequest, OrderSide, OrderType, TimeInForce
 from bot.utils.trade_logger import TradeLogger
 
 
@@ -15,7 +18,7 @@ class GridEngine:
     """$STEPごとに両サイドへグリッド指値を差しっぱなしにするエンジン。
 
     - 刺さらない限りキャンセル/差し替えは一切しない
-    - 片側10本ずつ（ENVで調整）を現在価格を中心に新規配置
+    - 片側levels本ずつ（ENVで調整）を現在価格を中心に新規配置
     - 価格が動いたら新しい価格帯に不足分のみ追加（過去の注文は放置）
     """
 
@@ -37,12 +40,12 @@ class GridEngine:
         # 最前列（現在価格に最も近い価格）だけは別オフセット（既定: 100 USD）
         self.first_offset = float(os.getenv("EDGEX_GRID_FIRST_OFFSET_USD", "100"))
         self.levels = int(os.getenv("EDGEX_GRID_LEVELS_PER_SIDE", "5"))
-        logger.debug(
-            "grid env raw: STEP_USD={} FIRST_OFFSET_USD={} LEVELS={} SIZE={}",
-            os.getenv("EDGEX_GRID_STEP_USD"),
-            os.getenv("EDGEX_GRID_FIRST_OFFSET_USD"),
-            os.getenv("EDGEX_GRID_LEVELS_PER_SIDE"),
-            (os.getenv("EDGEX_GRID_SIZE") or os.getenv("EDGEX_MM_SIZE") or os.getenv("EDGEX_SIZE")),
+        logger.info(
+            "グリッド設定: グリッド幅={}USD 初回オフセット={}USD レベル数={} サイズ={}BTC",
+            self.step,
+            self.first_offset,
+            self.levels,
+            self.size,
         )
         # レート制限回避のための連続発注間隔
         try:
@@ -67,9 +70,9 @@ class GridEngine:
 
     async def run(self) -> None:
         await self.adapter.connect()
-        self._running = True
+        self._running = False
         logger.info(
-            "grid engine started: step_usd={} levels={} size={}",
+            "グリッドエンジン起動: グリッド幅={}USD レベル数={} サイズ={}BTC",
             self.step,
             self.levels,
             self.size,
@@ -78,41 +81,32 @@ class GridEngine:
             while self._running:
                 try:
                     self._loop_iter += 1
-                    logger.debug(
-                        "grid loop start: iter={} placed_buy={} placed_sell={} initialized={}",
-                        self._loop_iter,
-                        len(self.placed_buy_px_to_id),
-                        len(self.placed_sell_px_to_id),
-                        self.initialized,
-                    )
-                    if not self.initialized:
-                        # 初回だけ並べる
-                        mid = None
-                        try:
-                            bid, ask = await self.adapter.get_best_bid_ask(self.symbol)  # type: ignore[attr-defined]
-                            logger.debug("init phase: best bid={} ask={}", bid, ask)
-                            if bid and ask:
-                                mid = (float(bid) + float(ask)) / 2.0
-                        except Exception as e:
-                            logger.debug("best bid/ask fetch failed on init: {}", e)
-                        if mid is None:
-                            t = await self.adapter.get_ticker(self.symbol)
-                            mid = float(t.price)
-                        logger.debug("init phase: mid price decided={}", mid)
-                        await self._ensure_grid(mid)
-                    else:
-                        # 初期配置後: 約定検知→補充（価格ドリフトでは追加しない）
-                        logger.debug("replenish phase: start")
-                        await self._replenish_if_filled()
+                    logger.debug("グリッドループ開始: iter={} 配置済み買い={} 配置済み売り={} 初期化済み={}", 
+                                self._loop_iter, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id), self.initialized)
+                    
+                    # 現在価格取得
+                    try:
+                        mid_price = await self.adapter.get_mid_price(self.symbol)  # type: ignore[attr-defined]
+                    except Exception as e:
+                        logger.warning("中間価格の取得に失敗: {}", e)
+                        await asyncio.sleep(self.poll_interval_sec)
+                        continue
+
+                    # グリッド配置
+                    await self._ensure_grid(mid_price)
+                    
+                    # 約定確認と補充
+                    await self._replenish_if_filled()
+                    
                 except Exception as e:
-                    logger.warning("grid loop error: {}", e)
-                logger.debug("grid loop end: iter={} sleep_sec={}", self._loop_iter, self.poll_interval_sec)
+                    logger.warning("グリッドループエラー: {}", e)
+                logger.debug("グリッドループ終了: iter={} 待機時間={}秒", self._loop_iter, self.poll_interval_sec)
                 await asyncio.sleep(self.poll_interval_sec)
                 # 定期: クローズ損益の新規行を取り込み
                 await self._poll_closed_pnl_once()
         finally:
             await self.adapter.close()
-            logger.info("grid engine stopped")
+            logger.info("グリッドエンジン停止")
 
     async def _ensure_grid(self, mid_price: float) -> None:
         # 最良気配からスタートし、「初回のみ±first_offset」を出し、その後は±stepで片側levels本ずつ
@@ -123,7 +117,8 @@ class GridEngine:
             bid, ask = await self.adapter.get_best_bid_ask(self.symbol)  # type: ignore[attr-defined]
         except Exception:
             pass
-        logger.debug("ensure_grid: inputs mid={} best_bid={} best_ask={} first_offset={} step={} levels={}", mid_price, bid, ask, self.first_offset, self.step, self.levels)
+        logger.debug("グリッド配置確認: 中間価格={} 最良買い={} 最良売り={} 初回オフセット={} グリッド幅={} レベル数={}", 
+                    mid_price, bid, ask, self.first_offset, self.step, self.levels)
 
         # フォールバック: 最良が無いときはmidから±step
         if bid is None:
@@ -134,37 +129,48 @@ class GridEngine:
         # BUY側
         buys = []
         if not self.initialized:
+            # 初回のみ: first_offsetで1本
             buys.append(float(bid) - self.first_offset)
-        # 以降は -step 間隔（既存最小から外側へ）
-        base_buy_start = float(bid) - (self.first_offset if not self.initialized else 0.0)
-        for j in range(1, self.levels if not self.initialized else self.levels + 1):
-            buys.append(base_buy_start - j * self.step)
-        logger.debug("ensure_grid: planned BUY prices ({}): {}", len(buys), sorted([round(px, 8) for px in buys]))
+            # その後、stepずつ外側へ (levels-1) 本
+            for j in range(1, self.levels):
+                buys.append(float(bid) - self.first_offset - j * self.step)
+        else:
+            # 2回目以降: bidからstepずつ外側へlevels本
+            for j in range(1, self.levels + 1):
+                buys.append(float(bid) - j * self.step)
+        
+        logger.debug("計画された買い注文価格 ({}本): {}", len(buys), sorted([round(px, 2) for px in buys]))
         for px in buys:
             if px <= 0:
                 continue
             if self._not_placed(px, side=OrderSide.BUY):
-                logger.debug("ensure_grid: place BUY at {} (not placed yet)", px)
+                logger.info("買い注文配置: 価格=${:.2f} (未配置)", px)
                 await self._place_limit(side=OrderSide.BUY, price=px)
 
         # SELL側
         sells = []
         if not self.initialized:
+            # 初回のみ: first_offsetで1本
             sells.append(float(ask) + self.first_offset)
-        base_sell_start = float(ask) + (self.first_offset if not self.initialized else 0.0)
-        for j in range(1, self.levels if not self.initialized else self.levels + 1):
-            sells.append(base_sell_start + j * self.step)
-        logger.debug("ensure_grid: planned SELL prices ({}): {}", len(sells), sorted([round(px, 8) for px in sells]))
+            # その後、stepずつ外側へ (levels-1) 本
+            for j in range(1, self.levels):
+                sells.append(float(ask) + self.first_offset + j * self.step)
+        else:
+            # 2回目以降: askからstepずつ外側へlevels本
+            for j in range(1, self.levels + 1):
+                sells.append(float(ask) + j * self.step)
+        
+        logger.debug("計画された売り注文価格 ({}本): {}", len(sells), sorted([round(px, 2) for px in sells]))
         for px in sells:
             if self._not_placed(px, side=OrderSide.SELL):
-                logger.debug("ensure_grid: place SELL at {} (not placed yet)", px)
+                logger.info("売り注文配置: 価格=${:.2f} (未配置)", px)
                 await self._place_limit(side=OrderSide.SELL, price=px)
 
         self.initialized = True
         logger.info(
-            "grid initialized: buys={} sells={}",
-            sorted(list(self.placed_buy_px_to_id.keys())),
-            sorted(list(self.placed_sell_px_to_id.keys())),
+            "グリッド初期化完了: 買い注文={} 売り注文={}",
+            sorted([round(px, 2) for px in self.placed_buy_px_to_id.keys()]),
+            sorted([round(px, 2) for px in self.placed_sell_px_to_id.keys()]),
         )
         self.tlog.log_event(event="GRID_INIT", symbol=self.symbol, data={
             "buys": sorted(list(self.placed_buy_px_to_id.keys())),
@@ -181,20 +187,21 @@ class GridEngine:
         attempts = 3
         for attempt in range(attempts):
             try:
-                logger.debug("place_limit: attempt={} side={} price={} size={}", attempt + 1, side, price, self.size)
+                logger.debug("注文発注試行: 試行回数={} サイド={} 価格={} サイズ={}", attempt + 1, side, price, self.size)
                 order = OrderRequest(
                     symbol=self.symbol,
                     side=side,
                     type=OrderType.LIMIT,
                     quantity=self.size,
                     price=price,
+                    time_in_force=TimeInForce.POST_ONLY,  # ← POST_ONLY追加
                 )
                 res = await self.adapter.place_order(order)
                 if side == OrderSide.BUY:
                     self.placed_buy_px_to_id[price] = res.id
                 else:
                     self.placed_sell_px_to_id[price] = res.id
-                logger.info("grid placed: side={} px={} size={} id={}", side, price, self.size, res.id)
+                logger.info("グリッド注文配置完了: サイド={} 価格=${:.2f} サイズ={} 注文ID={}", side, price, self.size, res.id)
                 self.tlog.log_order(
                     action="GRID_PLACE",
                     symbol=self.symbol,
@@ -207,7 +214,7 @@ class GridEngine:
                 return
             except Exception as e:
                 msg = str(e)
-                logger.warning("grid place failed: side={} px={} reason={}", side, price, msg)
+                logger.warning("注文発注失敗 (試行{}/{}): {}", attempt + 1, attempts, msg)
                 self.tlog.log_event(event="GRID_PLACE_FAIL", symbol=self.symbol, data={
                     "side": (side.value if hasattr(side, "value") else str(side)),
                     "price": price,
@@ -219,23 +226,23 @@ class GridEngine:
                     try:
                         import re
                         if side == OrderSide.SELL:
-                            m = re.search(r"minSellPrice': '([0-9.]+)" , msg)
+                            m = re.search(r"minSellPrice': '([0-9.]+)", msg)
                             if m:
                                 clamp = float(m.group(1))
                                 if clamp > 0:
                                     price = max(price, clamp)
-                                    logger.info("clamp SELL price to minSellPrice={} and retry", clamp)
+                                    logger.info("売り価格を最小価格にクランプ: ${:.2f} → 再試行", clamp)
                                     self.tlog.log_event(event="GRID_CLAMP", symbol=self.symbol, data={
                                         "side": "SELL",
                                         "clampTo": clamp,
                                     })
                         else:
-                            m = re.search(r"maxBuyPrice': '([0-9.]+)" , msg)
+                            m = re.search(r"maxBuyPrice': '([0-9.]+)", msg)
                             if m:
                                 clamp = float(m.group(1))
                                 if clamp > 0:
                                     price = min(price, clamp)
-                                    logger.info("clamp BUY price to maxBuyPrice={} and retry", clamp)
+                                    logger.info("買い価格を最大価格にクランプ: ${:.2f} → 再試行", clamp)
                                     self.tlog.log_event(event="GRID_CLAMP", symbol=self.symbol, data={
                                         "side": "BUY",
                                         "clampTo": clamp,
@@ -246,14 +253,13 @@ class GridEngine:
                     continue
                 if ("rateLimit" in msg or "rateLimitWindows" in msg or "429" in msg) and attempt < attempts - 1:
                     wait_s = max(1.0, self.op_spacing_sec)
-                    logger.info("rate limit detected, wait {}s then retry", wait_s)
+                    logger.info("レート制限検出: {}秒待機後に再試行", wait_s)
                     self.tlog.log_event(event="GRID_RATE_LIMIT", symbol=self.symbol, data={
-                        "wait_s": wait_s,
-                        "attempt": attempt + 1,
+                        "wait_sec": wait_s,
                     })
                     await asyncio.sleep(wait_s)
                     continue
-                logger.warning("grid place failed (final): {}", e)
+                logger.error("注文発注最終失敗: サイド={} 価格={} 理由={}", side, price, msg)
                 self.tlog.log_event(event="GRID_PLACE_FAIL_FINAL", symbol=self.symbol, data={
                     "side": (side.value if hasattr(side, "value") else str(side)),
                     "price": price,
@@ -265,58 +271,51 @@ class GridEngine:
 
 
     async def _replenish_if_filled(self) -> None:
-        """Detect fills from the active-order snapshot and rebuild the grid around price.
+        """約定を検出してグリッドを補充する。
 
-        - SELL fill: add a BUY close to the market and extend the SELL ladder upward.
-        - BUY fill: add a SELL close to the market and extend the BUY ladder downward.
-        Keeps at most self.levels orders on each side.
+        - SELL約定: 市場近くにBUYを追加し、SELL側を上方に延長
+        - BUY約定: 市場近くにSELLを追加し、BUY側を下方に延長
+        各サイド最大self.levels本まで保持
         """
         try:
             bid, ask = await self.adapter.get_best_bid_ask(self.symbol)  # type: ignore[attr-defined]
         except Exception as e:
-            logger.debug("best bid/ask fetch failed in replenish: {}", e)
+            logger.debug("補充時の最良気配取得失敗: {}", e)
             self.tlog.log_event(event="GRID_BEST_BID_ASK_FAIL", symbol=self.symbol, data={"error": str(e)})
             bid = ask = None
         try:
             active = await self.adapter.list_active_orders(self.symbol)  # type: ignore[attr-defined]
         except Exception as e:
-            logger.warning("active orders fetch failed: {}", e)
+            logger.warning("アクティブ注文の取得失敗: {}", e)
             self.tlog.log_event(event="GRID_ACTIVE_FETCH_FAIL", symbol=self.symbol, data={"error": str(e)})
             active = []
 
-        # Build a set of active order IDs regardless of side; extract robustly across shapes
+        # アクティブ注文IDのセットを構築
         active_ids = set()
-        try:
-            for it in (active or []):
-                if not isinstance(it, dict):
-                    continue
-                oid = (
-                    str((it.get("raw") or {}).get("orderId") or it.get("orderId") or it.get("id") or "")
-                )
-                if oid:
-                    active_ids.add(oid)
-        except Exception:
-            pass
+        for o in active:
+            oid = None
+            if hasattr(o, "id"):
+                oid = o.id
+            elif hasattr(o, "order_id"):
+                oid = o.order_id
+            elif isinstance(o, dict):
+                oid = o.get("id") or o.get("order_id") or o.get("orderId")
+            if oid:
+                active_ids.add(str(oid))
 
         logger.debug(
-            "replenish: best_bid={} best_ask={} active_count={} active_ids={} placed_buy={} placed_sell={}",
+            "補充確認: 最良買い={} 最良売り={} アクティブ注文数={} アクティブID数={} 配置済み買い={} 配置済み売り={}",
             bid,
             ask,
-            (0 if active is None else len(active)),
+            len(active),
             len(active_ids),
             len(self.placed_buy_px_to_id),
             len(self.placed_sell_px_to_id),
         )
 
-        if active is None or len(active) == 0:
-            logger.debug("skip replenish: active orders empty")
-            self.tlog.log_event(event="GRID_SKIP_REPLENISH_EMPTY_ACTIVE", symbol=self.symbol, data={})
-            return
-
-        filled_buy_prices: list[float] = []
-        filled_sell_prices: list[float] = []
-
-        # Detect fills via ID disappearance, side is inferred from which map held the id
+        # 約定済み価格を検出
+        filled_buy_prices = []
+        filled_sell_prices = []
         for px, oid in list(self.placed_buy_px_to_id.items()):
             if str(oid) not in active_ids:
                 filled_buy_prices.append(px)
@@ -327,14 +326,14 @@ class GridEngine:
                 self.placed_sell_px_to_id.pop(px, None)
 
         logger.debug(
-            "replenish: detected fills -> BUY_filled={} SELL_filled={}",
+            "補充: 約定検出 → 買い約定={} 売り約定={}",
             sorted(filled_buy_prices),
             sorted(filled_sell_prices),
         )
 
         if filled_sell_prices:
             filled_sell_prices.sort()
-            logger.info("replenish trigger: detected SELL fill prices={}", filled_sell_prices)
+            logger.info("補充トリガー: 売り注文約定 価格={}", [round(px, 2) for px in filled_sell_prices])
             self.tlog.log_event(
                 event="GRID_FILL_DETECTED",
                 symbol=self.symbol,
@@ -347,7 +346,7 @@ class GridEngine:
                 while new_buy_px and new_buy_px > 0 and new_buy_px in self.placed_buy_px_to_id:
                     new_buy_px -= self.step
                 if new_buy_px and new_buy_px > 0 and self._not_placed(new_buy_px, OrderSide.BUY):
-                    logger.debug("replenish: place BUY to replace SELL fill -> new_buy_px={}", new_buy_px)
+                    logger.info("補充: 売り約定を補うため買い注文配置 → 価格=${:.2f}", new_buy_px)
                     await self._place_limit(OrderSide.BUY, new_buy_px)
             for filled_px in filled_sell_prices:
                 reference = max(self.placed_sell_px_to_id.keys(), default=filled_px)
@@ -358,12 +357,12 @@ class GridEngine:
                 while new_sell_px in self.placed_sell_px_to_id:
                     new_sell_px += self.step
                 if self._not_placed(new_sell_px, OrderSide.SELL):
-                    logger.debug("replenish: extend SELL ladder -> new_sell_px={}", new_sell_px)
+                    logger.info("補充: 売り側延長 → 価格=${:.2f}", new_sell_px)
                     await self._place_limit(OrderSide.SELL, new_sell_px)
 
         if filled_buy_prices:
             filled_buy_prices.sort(reverse=True)
-            logger.info("replenish trigger: detected BUY fill prices={}", filled_buy_prices)
+            logger.info("補充トリガー: 買い注文約定 価格={}", [round(px, 2) for px in filled_buy_prices])
             self.tlog.log_event(
                 event="GRID_FILL_DETECTED",
                 symbol=self.symbol,
@@ -376,7 +375,7 @@ class GridEngine:
                 while new_sell_px in self.placed_sell_px_to_id:
                     new_sell_px += self.step
                 if self._not_placed(new_sell_px, OrderSide.SELL):
-                    logger.debug("replenish: place SELL to replace BUY fill -> new_sell_px={}", new_sell_px)
+                    logger.info("補充: 買い約定を補うため売り注文配置 → 価格=${:.2f}", new_sell_px)
                     await self._place_limit(OrderSide.SELL, new_sell_px)
             for filled_px in filled_buy_prices:
                 deepest = min(self.placed_buy_px_to_id.keys(), default=filled_px)
@@ -384,23 +383,26 @@ class GridEngine:
                 while new_buy_px and new_buy_px > 0 and new_buy_px in self.placed_buy_px_to_id:
                     new_buy_px -= self.step
                 if new_buy_px and new_buy_px > 0 and self._not_placed(new_buy_px, OrderSide.BUY):
-                    logger.debug("replenish: extend BUY ladder -> new_buy_px={}", new_buy_px)
+                    logger.info("補充: 買い側延長 → 価格=${:.2f}", new_buy_px)
                     await self._place_limit(OrderSide.BUY, new_buy_px)
 
+        # レベル数超過時は最も遠い注文をキャンセル
         if len(self.placed_buy_px_to_id) > self.levels:
             to_cancel_px = sorted(self.placed_buy_px_to_id.keys())[0]
             oid = self.placed_buy_px_to_id.pop(to_cancel_px)
             try:
                 await self.adapter.cancel_order(oid)
-            except Exception:
-                logger.debug("force cancel buy id={} px={} to keep levels", oid, to_cancel_px)
+                logger.info("レベル数超過: 買い注文キャンセル ID={} 価格=${:.2f}", oid, to_cancel_px)
+            except Exception as e:
+                logger.debug("買い注文キャンセル失敗: ID={} 価格=${:.2f} エラー={}", oid, to_cancel_px, e)
         if len(self.placed_sell_px_to_id) > self.levels:
             to_cancel_px = sorted(self.placed_sell_px_to_id.keys())[-1]
             oid = self.placed_sell_px_to_id.pop(to_cancel_px)
             try:
                 await self.adapter.cancel_order(oid)
-            except Exception:
-                logger.debug("force cancel sell id={} px={} to keep levels", oid, to_cancel_px)
+                logger.info("レベル数超過: 売り注文キャンセル ID={} 価格=${:.2f}", oid, to_cancel_px)
+            except Exception as e:
+                logger.debug("売り注文キャンセル失敗: ID={} 価格=${:.2f} エラー={}", oid, to_cancel_px, e)
 
     def stop(self) -> None:
         self._running = False
@@ -418,69 +420,30 @@ class GridEngine:
             client = getattr(self.adapter, "_client", None)
             if client is None:
                 return
-            rows = None
-
-            async def _call_get_page(fn):
-                import inspect as _inspect
-                from types import SimpleNamespace
-                params_named = {}
-                try:
-                    sig = _inspect.signature(fn)
-                    names = sig.parameters.keys()
-                except Exception:
-                    names = []
-                if "account_id" in names:
-                    params_named["account_id"] = self.adapter.account_id  # type: ignore[attr-defined]
-                elif "accountId" in names:
-                    params_named["accountId"] = str(self.adapter.account_id)  # type: ignore[attr-defined]
-                if "size" in names:
-                    params_named["size"] = 50
-                elif "pageSize" in names:
-                    params_named["pageSize"] = 50
-                if "params" in names and len(names) == 1:
-                    # SDKによっては dataclass Params を要求（属性アクセス: .size 等）
-                    params_obj = None
-                    try:
-                        from edgex_sdk.account.types import GetPositionTransactionPageParams  # type: ignore
-                        params_obj = GetPositionTransactionPageParams()
-                        # 該当フィールド名の差異を吸収
-                        if hasattr(params_obj, "account_id"):
-                            setattr(params_obj, "account_id", self.adapter.account_id)  # type: ignore[attr-defined]
-                        elif hasattr(params_obj, "accountId"):
-                            setattr(params_obj, "accountId", str(self.adapter.account_id))  # type: ignore[attr-defined]
-                        if hasattr(params_obj, "size"):
-                            setattr(params_obj, "size", str(params_named.get("size", params_named.get("pageSize", 50))))
-                        elif hasattr(params_obj, "pageSize"):
-                            setattr(params_obj, "pageSize", str(params_named.get("pageSize", params_named.get("size", 50))))
-                    except Exception:
-                        params_obj = None
-                    if params_obj is None:
-                        params_obj = SimpleNamespace(
-                            accountId=params_named.get("accountId", str(self.adapter.account_id)),  # type: ignore[attr-defined]
-                            size=str(params_named.get("size", params_named.get("pageSize", 50))),
-                        )
-                    return await fn(params=params_obj)
-                return await fn(**params_named) if params_named else await fn()
-
-            if hasattr(client, "account") and hasattr(client.account, "get_position_transaction_page"):
-                res = await _call_get_page(client.account.get_position_transaction_page)
-                rows = ((res or {}).get("data") or {}).get("dataList")
-            elif hasattr(client, "get_position_transaction_page"):
-                res = await _call_get_page(client.get_position_transaction_page)
-                rows = ((res or {}).get("data") or {}).get("dataList")
-            if not rows:
-                return
-            new_rows = []
-            for r in rows:
-                rid = str(r.get("id") or "")
-                if self._last_closed_id is None or rid > self._last_closed_id:
-                    new_rows.append(r)
-            if new_rows:
-                new_rows = sorted(new_rows, key=lambda r: r.get("id"))
-                self._last_closed_id = str(new_rows[-1].get("id"))
-                appended = self.tlog.log_closed_rows(new_rows)
-                if appended:
-                    logger.info("closed pnl appended {} rows", appended)
+            from edgex_sdk.models.position import GetClosedPnlParams
+            params = GetClosedPnlParams(
+                filter_coin_id_list=[],
+                filter_contract_id_list=[self.symbol],
+                size="100",
+                offset_data="",
+            )
+            resp = await client.position.get_closed_pnl(params)
+            rows = []
+            if hasattr(resp, "data") and hasattr(resp.data, "rows"):
+                rows = resp.data.rows or []
+            elif isinstance(resp, dict):
+                data = resp.get("data", {})
+                if isinstance(data, dict):
+                    rows = data.get("rows", [])
+            for row in rows:
+                row_id = getattr(row, "id", None) or (row.get("id") if isinstance(row, dict) else None)
+                if row_id and (self._last_closed_id is None or str(row_id) > str(self._last_closed_id)):
+                    self._last_closed_id = str(row_id)
+                    pnl = getattr(row, "pnl", None) or (row.get("pnl") if isinstance(row, dict) else None)
+                    logger.info("決済済みPnL検出: ID={} PnL={}", row_id, pnl)
+                    self.tlog.log_event(event="GRID_CLOSED_PNL", symbol=self.symbol, data={
+                        "id": row_id,
+                        "pnl": pnl,
+                    })
         except Exception as e:
-            logger.debug("closed pnl poll failed: {}", e)
-
+            logger.debug("決済済みPnLポーリング失敗: {}", e)

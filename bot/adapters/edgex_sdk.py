@@ -12,7 +12,7 @@ from edgex_sdk import Client as EdgeXClient, OrderSide as SDKOrderSide
 import httpx  # for error detail extraction and public API calls
 
 from bot.adapters.base import ExchangeAdapter
-from bot.models.types import Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker
+from bot.models.types import Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce
 
 
 class EdgeXSDKAdapter(ExchangeAdapter):
@@ -256,14 +256,73 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         except Exception:
             pass
 
+        # メイカー保証: ベスト気配から一刻み外す（post-onlyが無視される場合の保険）
+        try:
+            best_bid, best_ask = await self.get_best_bid_ask(contract_id)
+        except Exception:
+            best_bid, best_ask = None, None
+        try:
+            _tick_env = os.getenv("EDGEX_PRICE_TICK")
+            tick_val = float(_tick_env) if _tick_env else float(rules.get("price_tick", 0.1))
+            if tick_val <= 0:
+                tick_val = 0.1
+        except Exception:
+            tick_val = 0.1
+
+        if order.side == OrderSide.BUY and best_ask is not None:
+            try:
+                price = min(price, float(Decimal(str(best_ask)) - Decimal(str(tick_val))))
+            except Exception:
+                pass
+        elif order.side == OrderSide.SELL and best_bid is not None:
+            try:
+                price = max(price, float(Decimal(str(best_bid)) + Decimal(str(tick_val))))
+            except Exception:
+                pass
+
+        # 刻みへ最終スナップ（サイドに応じて受動側へ寄せる）
+        try:
+            tick = Decimal(str(tick_val))
+            price_dec = Decimal(str(price)) / tick
+            rounded_units = price_dec.to_integral_value(
+                rounding=ROUND_FLOOR if order.side == OrderSide.BUY else ROUND_CEILING
+            )
+            price = float(rounded_units * tick)
+        except Exception:
+            pass
+
         side = SDKOrderSide.BUY if order.side == OrderSide.BUY else SDKOrderSide.SELL
         payload = {"contract_id": contract_id, "size": str(qty), "price": str(price), "side": side.value if hasattr(side, "value") else str(side)}
+
+        # SDKの引数名差異に対応: post-only/time-in-forceを可能なら渡す
+        extra_params: Dict[str, Any] = {}
+        try:
+            import inspect as _inspect
+            sig = _inspect.signature(self._client.create_limit_order)
+            names = set(sig.parameters.keys())
+        except Exception:
+            names = set()
+
+        is_post_only = (order.time_in_force == TimeInForce.POST_ONLY)
+        tif_str = None
+        if order.time_in_force is not None:
+            tif_str = str(order.time_in_force.value if hasattr(order.time_in_force, "value") else order.time_in_force)
+        if "post_only" in names:
+            extra_params["post_only"] = is_post_only
+        if "postOnly" in names:
+            extra_params["postOnly"] = is_post_only
+        if tif_str:
+            if "time_in_force" in names:
+                extra_params["time_in_force"] = tif_str
+            if "timeInForce" in names:
+                extra_params["timeInForce"] = tif_str
         try:
             res = await self._client.create_limit_order(
                 contract_id=contract_id,
                 size=str(qty),
                 price=str(price),
                 side=side,
+                **extra_params,
             )
         except Exception as e:
             # Extract as much detail as possible from SDK/httpx error

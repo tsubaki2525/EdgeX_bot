@@ -83,7 +83,8 @@ class VolumeEngine:
         logger.info("=== エントリーフェーズ ===")
         
         # 現在価格を取得
-        current_price = await self.adapter.get_mid_price(self.contract_id)
+        ticker = await self.adapter.get_ticker(self.contract_id)
+        current_price = ticker.price
         logger.info("現在価格: ${:.1f}", current_price)
         
         # エントリー価格を計算
@@ -175,7 +176,8 @@ class VolumeEngine:
         logger.info("保持時間終了、決済処理開始")
         
         # 現在価格を取得
-        current_price = await self.adapter.get_mid_price(self.contract_id)
+        ticker = await self.adapter.get_ticker(self.contract_id)
+        current_price = ticker.price
         
         # エグジット価格を計算
         if self.position_side == "LONG":

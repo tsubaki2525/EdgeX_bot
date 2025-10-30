@@ -78,7 +78,7 @@ class VolumeEngine:
         buy_order_req = OrderRequest(
             symbol=self.contract_id,
             side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
+            type=OrderType.LIMIT,
             quantity=self.size,
             price=buy_price
         )
@@ -88,7 +88,7 @@ class VolumeEngine:
         sell_order_req = OrderRequest(
             symbol=self.contract_id,
             side=OrderSide.SELL,
-            order_type=OrderType.LIMIT,
+            type=OrderType.LIMIT,
             quantity=self.size,
             price=sell_price
         )
@@ -146,7 +146,7 @@ class VolumeEngine:
                 exit_order_req = OrderRequest(
                     symbol=self.contract_id,
                     side=OrderSide.SELL,
-                    order_type=OrderType.LIMIT,
+                    type=OrderType.LIMIT,
                     quantity=abs(self.position_size),
                     price=exit_price
                 )
@@ -156,7 +156,7 @@ class VolumeEngine:
                 exit_order_req = OrderRequest(
                     symbol=self.contract_id,
                     side=OrderSide.BUY,
-                    order_type=OrderType.LIMIT,
+                    type=OrderType.LIMIT,
                     quantity=abs(self.position_size),
                     price=exit_price
                 )

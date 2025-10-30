@@ -34,9 +34,12 @@ async def main():
         pass
     
     # 環境変数から設定を読み込む
-    base_url = os.getenv("EDGEX_BASE_URL", "https://api.edgex.exchange")
+    base_url = os.getenv("EDGEX_BASE_URL", "https://pro.edgex.exchange")
     account_id = os.getenv("EDGEX_ACCOUNT_ID")
     l2_private_key = os.getenv("EDGEX_L2_PRIVATE_KEY") or os.getenv("EDGEX_STARK_PRIVATE_KEY")
+    
+    # contractId（グリッドボットと同じ）
+    contract_id = os.getenv("EDGEX_CONTRACT_ID", "10000001")
     
     if not account_id:
         raise ValueError("EDGEX_ACCOUNT_ID is not set")
@@ -44,7 +47,6 @@ async def main():
         raise ValueError("EDGEX_L2_PRIVATE_KEY (or EDGEX_STARK_PRIVATE_KEY) is not set")
     
     # ボット設定
-    symbol = os.getenv("EDGEX_VOLUME_SYMBOL", "BTC-USD-PERP")
     size = Decimal(os.getenv("EDGEX_VOLUME_SIZE", "0.01"))
     entry_offset = Decimal(os.getenv("EDGEX_VOLUME_ENTRY_OFFSET_USD", "10"))
     exit_offset = Decimal(os.getenv("EDGEX_VOLUME_EXIT_OFFSET_USD", "10"))
@@ -54,7 +56,7 @@ async def main():
     logger.info("=== Volume Trading Bot ===")
     logger.info("base_url: {}", base_url)
     logger.info("account_id: {}", account_id)
-    logger.info("symbol: {}", symbol)
+    logger.info("contract_id: {}", contract_id)
     logger.info("size: {}", size)
     logger.info("entry_offset: {} USD", entry_offset)
     logger.info("exit_offset: {} USD", exit_offset)
@@ -71,7 +73,7 @@ async def main():
     # エンジン初期化
     engine = VolumeEngine(
         adapter=adapter,
-        symbol=symbol,
+        contract_id=contract_id,  # symbolではなくcontractId
         size=size,
         entry_offset_usd=entry_offset,
         exit_offset_usd=exit_offset,

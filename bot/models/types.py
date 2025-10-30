@@ -25,9 +25,9 @@ class OrderType(str, Enum):
 
 class TimeInForce(str, Enum):
     """注文の有効期限タイプ"""
-    GTC = "GTC"  # Good Till Cancel（キャンセルされるまで有効）
-    IOC = "IOC"  # Immediate Or Cancel（即座に約定しない部分はキャンセル）
-    FOK = "FOK"  # Fill Or Kill（全量約定しなければキャンセル）
+    GTC = "GOOD_TIL_CANCEL"  # Good Till Cancel（キャンセルされるまで有効）
+    IOC = "IMMEDIATE_OR_CANCEL"  # Immediate Or Cancel（即座に約定しない部分はキャンセル）
+    FOK = "FILL_OR_KILL"  # Fill Or Kill（全量約定しなければキャンセル）
     POST_ONLY = "POST_ONLY"  # Post Only（MAKER注文のみ、TAKERにならない）
 
 

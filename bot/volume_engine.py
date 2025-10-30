@@ -12,10 +12,10 @@ Volume Trading Engine
 import asyncio
 from decimal import Decimal
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from loguru import logger
 
-from bot.models.types import OrderSide
+from bot.models.types import OrderSide, OrderRequest, OrderType
 from bot.adapters.base import ExchangeAdapter
 
 
@@ -51,29 +51,30 @@ class VolumeEngine:
         self.reorder_interval = reorder_interval_seconds
         
         # 状態管理
-        self.position_size = Decimal("0")  # 現在のポジション（+ = ロング, - = ショート）
-        self.entry_price: Optional[Decimal] = None  # エントリー価格
-        self.entry_time: Optional[datetime] = None  # エントリー時刻
-        self.buy_order_id: Optional[str] = None  # 買い注文ID
-        self.sell_order_id: Optional[str] = None  # 売り注文ID
+        self.position_size = Decimal("0")
+        self.entry_price: Optional[Decimal] = None
+        self.entry_time: Optional[datetime] = None
+        self.buy_order_id: Optional[str] = None
+        self.sell_order_id: Optional[str] = None
         
         # 統計
-        self.total_volume = Decimal("0")  # 累計取引量
-        self.total_pnl = Decimal("0")  # 累計損益
-        self.cycle_count = 0  # サイクル数
+        self.total_volume = Decimal("0")
+        self.total_pnl = Decimal("0")
+        self.cycle_count = 0
         
-    async def start(self):
-        """ボット開始"""
+    async def run(self):
+        """ボット開始（グリッドボットと同じメソッド名）"""
         logger.info("volume engine started: symbol={} size={} entry_offset={} exit_offset={} hold_time={}s",
                    self.symbol, self.size, self.entry_offset, self.exit_offset, self.hold_time)
+        
+        # アダプター接続
+        await self.adapter.connect()
         
         while True:
             try:
                 if self.position_size == 0:
-                    # ポジションなし → エントリーフェーズ
                     await self._entry_phase()
                 else:
-                    # ポジションあり → 決済フェーズ
                     await self._exit_phase()
                     
                 await asyncio.sleep(1)
@@ -87,7 +88,8 @@ class VolumeEngine:
         logger.info("=== ENTRY PHASE ===")
         
         # 現在価格を取得
-        mid_price = await self.adapter.get_mid_price(self.symbol)
+        ticker = await self.adapter.get_ticker(self.symbol)
+        mid_price = Decimal(str(ticker.price))
         logger.info("current price: {}", mid_price)
         
         # 買い注文と売り注文を出す
@@ -96,12 +98,27 @@ class VolumeEngine:
         
         logger.info("placing entry orders: buy={} sell={}", buy_price, sell_price)
         
-        self.buy_order_id = await self.adapter.place_limit_order(
-            self.symbol, OrderSide.BUY, buy_price, self.size
+        # 買い注文
+        buy_order_req = OrderRequest(
+            symbol=self.symbol,
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=self.size,
+            price=buy_price
         )
-        self.sell_order_id = await self.adapter.place_limit_order(
-            self.symbol, OrderSide.SELL, sell_price, self.size
+        buy_order = await self.adapter.place_order(buy_order_req)
+        self.buy_order_id = buy_order.order_id
+        
+        # 売り注文
+        sell_order_req = OrderRequest(
+            symbol=self.symbol,
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=self.size,
+            price=sell_price
         )
+        sell_order = await self.adapter.place_order(sell_order_req)
+        self.sell_order_id = sell_order.order_id
         
         logger.info("entry orders placed: buy_id={} sell_id={}", self.buy_order_id, self.sell_order_id)
         
@@ -110,8 +127,8 @@ class VolumeEngine:
             await asyncio.sleep(2)
             
             # 買い注文の約定確認
-            buy_filled = await self.adapter.is_order_filled(self.buy_order_id)
-            if buy_filled:
+            buy_order_status = await self.adapter.get_order(self.buy_order_id)
+            if buy_order_status.is_filled():
                 logger.info("BUY order filled! price={}", buy_price)
                 # 売り注文をキャンセル
                 await self.adapter.cancel_order(self.sell_order_id)
@@ -124,8 +141,8 @@ class VolumeEngine:
                 break
             
             # 売り注文の約定確認
-            sell_filled = await self.adapter.is_order_filled(self.sell_order_id)
-            if sell_filled:
+            sell_order_status = await self.adapter.get_order(self.sell_order_id)
+            if sell_order_status.is_filled():
                 logger.info("SELL order filled! price={}", sell_price)
                 # 買い注文をキャンセル
                 await self.adapter.cancel_order(self.buy_order_id)
@@ -157,31 +174,43 @@ class VolumeEngine:
         # 決済注文を出す（約定するまで繰り返す）
         while self.position_size != 0:
             # 現在価格を取得
-            mid_price = await self.adapter.get_mid_price(self.symbol)
+            ticker = await self.adapter.get_ticker(self.symbol)
+            mid_price = Decimal(str(ticker.price))
             
             # 決済注文を出す
             if self.position_size > 0:
                 # ロングポジション → 売り注文
                 exit_price = mid_price + self.exit_offset
                 logger.info("placing exit SELL order: price={}", exit_price)
-                exit_order_id = await self.adapter.place_limit_order(
-                    self.symbol, OrderSide.SELL, exit_price, abs(self.position_size)
+                exit_order_req = OrderRequest(
+                    symbol=self.symbol,
+                    side=OrderSide.SELL,
+                    order_type=OrderType.LIMIT,
+                    quantity=abs(self.position_size),
+                    price=exit_price
                 )
             else:
                 # ショートポジション → 買い注文
                 exit_price = mid_price - self.exit_offset
                 logger.info("placing exit BUY order: price={}", exit_price)
-                exit_order_id = await self.adapter.place_limit_order(
-                    self.symbol, OrderSide.BUY, exit_price, abs(self.position_size)
+                exit_order_req = OrderRequest(
+                    symbol=self.symbol,
+                    side=OrderSide.BUY,
+                    order_type=OrderType.LIMIT,
+                    quantity=abs(self.position_size),
+                    price=exit_price
                 )
+            
+            exit_order = await self.adapter.place_order(exit_order_req)
+            exit_order_id = exit_order.order_id
             
             # 1分間待つ（約定を確認）
             for _ in range(self.reorder_interval):
                 await asyncio.sleep(1)
                 
                 # 約定確認
-                filled = await self.adapter.is_order_filled(exit_order_id)
-                if filled:
+                exit_order_status = await self.adapter.get_order(exit_order_id)
+                if exit_order_status.is_filled():
                     logger.info("EXIT order filled! price={}", exit_price)
                     
                     # 損益計算

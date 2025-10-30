@@ -50,18 +50,33 @@ class VolumeEngine:
         
         await self.adapter.connect()
         
-        while True:
-            try:
-                if self.position_size == 0:
-                    await self._entry_phase()
-                else:
-                    await self._exit_phase()
-                    
-                await asyncio.sleep(1)
-                
-            except Exception as e:
-                logger.error("volume engine error: {}", e)
-                await asyncio.sleep(5)
+        try:
+            while True:
+                try:
+                    if self.position_size == 0:
+                        await self._entry_phase()
+                    else:
+                        await self._exit_phase()
+                except Exception as e:
+                    logger.error("volume engine error: {}", e)
+                    await asyncio.sleep(5)
+        finally:
+            await self.adapter.close()
+    
+    async def _is_order_filled(self, order_id: str) -> bool:
+        """注文が約定したかチェック（アクティブな注文リストから消えたら約定）"""
+        try:
+            active_orders = await self.adapter.list_active_orders(self.contract_id)
+            for order in active_orders:
+                oid = order.get("orderId") or order.get("id")
+                if str(oid) == str(order_id):
+                    # まだアクティブ = 未約定
+                    return False
+            # アクティブリストにない = 約定済み
+            return True
+        except Exception as e:
+            logger.debug("failed to check order status: {}", e)
+            return False
     
     async def _entry_phase(self):
         logger.info("=== ENTRY PHASE ===")
@@ -100,8 +115,8 @@ class VolumeEngine:
         while True:
             await asyncio.sleep(2)
             
-            buy_order_status = await self.adapter.get_order(self.buy_order_id)
-            if buy_order_status.is_filled():
+            buy_filled = await self._is_order_filled(self.buy_order_id)
+            if buy_filled:
                 logger.info("BUY order filled! price={}", buy_price)
                 await self.adapter.cancel_order(self.sell_order_id)
                 self.sell_order_id = None
@@ -111,8 +126,8 @@ class VolumeEngine:
                 logger.info("position: LONG {} @ {}", self.position_size, self.entry_price)
                 break
             
-            sell_order_status = await self.adapter.get_order(self.sell_order_id)
-            if sell_order_status.is_filled():
+            sell_filled = await self._is_order_filled(self.sell_order_id)
+            if sell_filled:
                 logger.info("SELL order filled! price={}", sell_price)
                 await self.adapter.cancel_order(self.buy_order_id)
                 self.buy_order_id = None
@@ -167,8 +182,7 @@ class VolumeEngine:
             for _ in range(self.reorder_interval):
                 await asyncio.sleep(1)
                 
-                exit_order_status = await self.adapter.get_order(exit_order_id)
-                if exit_order_status.is_filled():
+                if await self._is_order_filled(exit_order_id):
                     logger.info("EXIT order filled! price={}", exit_price)
                     
                     if self.position_size > 0:

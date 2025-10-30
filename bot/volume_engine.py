@@ -83,7 +83,7 @@ class VolumeEngine:
             price=buy_price
         )
         buy_order = await self.adapter.place_order(buy_order_req)
-        self.buy_order_id = buy_order.order_id
+        self.buy_order_id = buy_order.id
         
         sell_order_req = OrderRequest(
             symbol=self.contract_id,
@@ -93,7 +93,7 @@ class VolumeEngine:
             price=sell_price
         )
         sell_order = await self.adapter.place_order(sell_order_req)
-        self.sell_order_id = sell_order.order_id
+        self.sell_order_id = sell_order.id
         
         logger.info("entry orders placed: buy_id={} sell_id={}", self.buy_order_id, self.sell_order_id)
         
@@ -162,7 +162,7 @@ class VolumeEngine:
                 )
             
             exit_order = await self.adapter.place_order(exit_order_req)
-            exit_order_id = exit_order.order_id
+            exit_order_id = exit_order.id
             
             for _ in range(self.reorder_interval):
                 await asyncio.sleep(1)

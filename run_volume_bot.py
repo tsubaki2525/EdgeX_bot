@@ -40,7 +40,7 @@ async def main():
     stark_private_key=l2_private_key
  )
 
-    await adapter.initialize()
+    await adapter.connect()
     
     # エンジン初期化
     engine = VolumeEngine(

@@ -69,6 +69,15 @@ class GridEngine:
         self._last_closed_id: str | None = None
         self._last_closed_poll_ts: float = 0.0
 
+        # 中心価格（ステップでバケット化して固定）
+        self._grid_center: float | None = None
+
+        # 1ループあたりの新規発注上限（片側）
+        try:
+            self.max_new_per_loop = int(os.getenv("EDGEX_GRID_MAX_NEW_PER_LOOP", "2"))
+        except Exception:
+            self.max_new_per_loop = 2
+
     async def run(self) -> None:
         await self.adapter.connect()
         self._running = True
@@ -114,18 +123,30 @@ class GridEngine:
 
     async def _ensure_grid(self, mid_price: float):
         """
-        mid_priceを中心にグリッドを配置
+        ステップでバケット化した中心価格を基準にグリッドを配置
         初回 → first_offset を使う
         2回目以降 → step だけ使う
         """
+        def _bucketize(price: float) -> float:
+            step = float(self.step)
+            if step <= 0:
+                return price
+            return round(price / step) * step
+
+        # バケット化した中心を更新（ステップ境界を跨いだ時のみ）
+        new_center = _bucketize(mid_price)
+        if self._grid_center is None:
+            self._grid_center = new_center
+        elif new_center != self._grid_center:
+            self._grid_center = new_center
         # 初回配置
         if not self.initialized:
-            logger.info("初回グリッド配置: 中心価格=${:.1f}", mid_price)
+            logger.info("初回グリッド配置: 中心価格=${:.1f}", self._grid_center)
             
             # 買いグリッド（初回）
             for i in range(self.levels):
                 offset = self.first_offset + (i * self.step)
-                px = mid_price - offset
+                px = self._grid_center - offset  # type: ignore[operator]
                 if px not in self.placed_buy_px_to_id:
                     await self._place_order(OrderSide.BUY, px)
                     await asyncio.sleep(self.op_spacing_sec)
@@ -133,7 +154,7 @@ class GridEngine:
             # 売りグリッド（初回）
             for i in range(self.levels):
                 offset = self.first_offset + (i * self.step)
-                px = mid_price + offset
+                px = self._grid_center + offset  # type: ignore[operator]
                 if px not in self.placed_sell_px_to_id:
                     await self._place_order(OrderSide.SELL, px)
                     await asyncio.sleep(self.op_spacing_sec)
@@ -142,21 +163,25 @@ class GridEngine:
             logger.info("初回グリッド配置完了: 買い{}本 売り{}本", 
                        len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
         else:
-            # 2回目以降: step だけ使う
+            # 2回目以降: 固定中心を使い、片側あたり新規を上限化
+            new_buys = 0
+            new_sells = 0
             # 買いグリッド（追加）
             for i in range(self.levels):
                 offset = i * self.step
-                px = mid_price - offset
-                if px not in self.placed_buy_px_to_id:
+                px = self._grid_center - offset  # type: ignore[operator]
+                if px not in self.placed_buy_px_to_id and new_buys < self.max_new_per_loop:
                     await self._place_order(OrderSide.BUY, px)
+                    new_buys += 1
                     await asyncio.sleep(self.op_spacing_sec)
             
             # 売りグリッド（追加）
             for i in range(self.levels):
                 offset = i * self.step
-                px = mid_price + offset
-                if px not in self.placed_sell_px_to_id:
+                px = self._grid_center + offset  # type: ignore[operator]
+                if px not in self.placed_sell_px_to_id and new_sells < self.max_new_per_loop:
                     await self._place_order(OrderSide.SELL, px)
+                    new_sells += 1
                     await asyncio.sleep(self.op_spacing_sec)
 
     async def _place_order(self, side: OrderSide, price: float):
@@ -185,7 +210,24 @@ class GridEngine:
         """約定した注文を確認し、補充する"""
         try:
             active_orders = await self.adapter.list_active_orders(self.symbol)
-            active_ids = {o.id for o in active_orders}
+            # EdgeXアダプタは dict を返すため堅牢にIDを抽出する
+            active_ids = set()
+            for o in active_orders:
+                try:
+                    if isinstance(o, dict):
+                        oid = (
+                            o.get("orderId")
+                            or o.get("id")
+                            or o.get("order_id")
+                            or o.get("clientOrderId")
+                            or o.get("client_order_id")
+                        )
+                    else:
+                        oid = getattr(o, "id", None) or getattr(o, "orderId", None)
+                    if oid:
+                        active_ids.add(str(oid))
+                except Exception:
+                    continue
             
             # 買い注文の約定確認
             filled_buy_prices = []

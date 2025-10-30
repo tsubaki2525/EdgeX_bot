@@ -128,7 +128,24 @@ class VolumeEngine:
             
             # アクティブ注文を確認
             active_orders = await self.adapter.list_active_orders(self.contract_id)
-            active_ids = {o.id for o in active_orders}
+            # EdgeXアダプタは dict を返すため堅牢にIDを抽出する
+            active_ids = set()
+            for o in active_orders:
+                try:
+                    if isinstance(o, dict):
+                        oid = (
+                            o.get("orderId")
+                            or o.get("id")
+                            or o.get("order_id")
+                            or o.get("clientOrderId")
+                            or o.get("client_order_id")
+                        )
+                    else:
+                        oid = getattr(o, "id", None) or getattr(o, "orderId", None)
+                    if oid:
+                        active_ids.add(str(oid))
+                except Exception:
+                    continue
             
             # 買い注文が約定したか確認
             if self.buy_order_id not in active_ids:
@@ -212,7 +229,23 @@ class VolumeEngine:
             
             # アクティブ注文を確認
             active_orders = await self.adapter.list_active_orders(self.contract_id)
-            active_ids = {o.id for o in active_orders}
+            active_ids = set()
+            for o in active_orders:
+                try:
+                    if isinstance(o, dict):
+                        oid = (
+                            o.get("orderId")
+                            or o.get("id")
+                            or o.get("order_id")
+                            or o.get("clientOrderId")
+                            or o.get("client_order_id")
+                        )
+                    else:
+                        oid = getattr(o, "id", None) or getattr(o, "orderId", None)
+                    if oid:
+                        active_ids.add(str(oid))
+                except Exception:
+                    continue
             
             # 決済注文が約定したか確認
             if exit_order_id not in active_ids:

@@ -34,7 +34,7 @@ async def main():
     logger.info("reorder_interval: {} seconds", reorder_interval)
     
     # アダプター初期化
-    adapter = EdgeXSDKAdapter(account_id, l2_private_key)
+    adapter = EdgeXSDKAdapter(account_id, l2_private_key, l2_private_key)
     await adapter.initialize()
     
     # エンジン初期化

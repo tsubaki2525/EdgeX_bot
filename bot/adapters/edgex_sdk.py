@@ -269,6 +269,9 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         except Exception:
             tick_val = 0.1
 
+        strict_maker = str(os.getenv("EDGEX_STRICT_MAKER", "true")).lower() in ("1", "true", "yes")
+
+        orig_price_before_guard = price
         if order.side == OrderSide.BUY and best_ask is not None:
             try:
                 price = min(price, float(Decimal(str(best_ask)) - Decimal(str(tick_val))))
@@ -277,6 +280,20 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         elif order.side == OrderSide.SELL and best_bid is not None:
             try:
                 price = max(price, float(Decimal(str(best_bid)) + Decimal(str(tick_val))))
+            except Exception:
+                pass
+
+        # ベストが取れない場合のフォールバック
+        if (best_bid is None or best_ask is None) and strict_maker:
+            # 厳格モードでは発注を中止（後で再試行）
+            raise RuntimeError("strict maker: depth unavailable, skip order placement")
+        if (best_bid is None or best_ask is None) and not strict_maker:
+            try:
+                t = await self.get_ticker(contract_id)
+                if order.side == OrderSide.BUY:
+                    price = min(price, float(Decimal(str(t.price)) - Decimal(str(tick_val))))
+                else:
+                    price = max(price, float(Decimal(str(t.price)) + Decimal(str(tick_val))))
             except Exception:
                 pass
 
@@ -316,6 +333,24 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                 extra_params["time_in_force"] = tif_str
             if "timeInForce" in names:
                 extra_params["timeInForce"] = tif_str
+        # 一部SDKでは注文タイプでメイカー指定を行う場合がある
+        if is_post_only:
+            if "orderType" in names and "orderType" not in extra_params:
+                extra_params["orderType"] = "LIMIT_MAKER"
+            if "order_type" in names and "order_type" not in extra_params:
+                extra_params["order_type"] = "LIMIT_MAKER"
+
+        logger.debug(
+            "maker_guard: side={} orig_price={} best_bid={} best_ask={} tick={} final_price={} post_only={} strict={}",
+            order.side,
+            orig_price_before_guard,
+            best_bid,
+            best_ask,
+            tick_val,
+            price,
+            is_post_only,
+            strict_maker,
+        )
         try:
             res = await self._client.create_limit_order(
                 contract_id=contract_id,

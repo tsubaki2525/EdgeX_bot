@@ -144,10 +144,14 @@ class GridEngine:
                     logger.debug("グリッドループ開始: iter={} 配置済み買い={}本 配置済み売り={}本 初期化済み={}", 
                                 self._loop_iter, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id), self.initialized)
 
-                    # 現在価格取得
+                    # 現在価格取得: まず板(bid/ask)からミッド算出（429回避・短期キャッシュ活用）。失敗時のみティッカーにフォールバック。
                     try:
-                        ticker = await self.adapter.get_ticker(self.symbol)
-                        mid_price = ticker.price  # type: ignore[attr-defined]
+                        bid, ask = await self.adapter.get_best_bid_ask(self.symbol)
+                        if bid is not None and ask is not None:
+                            mid_price = (float(bid) + float(ask)) / 2.0
+                        else:
+                            ticker = await self.adapter.get_ticker(self.symbol)
+                            mid_price = ticker.price  # type: ignore[attr-defined]
                     except Exception as e:
                         logger.warning("中間価格の取得に失敗: {}", e)
                         await asyncio.sleep(self.poll_interval_sec)

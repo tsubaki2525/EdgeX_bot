@@ -69,7 +69,7 @@ async def main() -> None:
         logger.info("認証チェック開始: url={} account_id={}", auth_url, acct_str)
         params = {"accountId": acct_str}
         timeout = httpx.Timeout(6.0)
-        async with httpx.AsyncClient(timeout=timeout, headers={"Accept": "application/json"}) as client:
+        async with httpx.AsyncClient(timeout=timeout, headers={"Accept": "application/json"}, follow_redirects=True) as client:
             r = await client.get(auth_url, params=params)
             r.raise_for_status()
             body = r.json()

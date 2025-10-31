@@ -128,16 +128,18 @@ class GridEngine:
         2回目以降 → step だけ使う
         """
         def _bucketize(price: float) -> float:
+            # ヒステリシス: floorで固定方向に寄せ、中心更新は±step以上の変動時のみ
+            import math
             step = float(self.step)
             if step <= 0:
                 return price
-            return round(price / step) * step
+            return math.floor(price / step) * step
 
         # バケット化した中心を更新（ステップ境界を跨いだ時のみ）
         new_center = _bucketize(mid_price)
         if self._grid_center is None:
             self._grid_center = new_center
-        elif new_center != self._grid_center:
+        elif abs(new_center - self._grid_center) >= self.step:
             self._grid_center = new_center
         # 初回配置
         if not self.initialized:
@@ -167,7 +169,8 @@ class GridEngine:
             new_buys = 0
             new_sells = 0
             # 買いグリッド（追加）
-            for i in range(self.levels):
+            # 中心（i=0）には置かず、±stepから配置
+            for i in range(1, self.levels + 1):
                 offset = i * self.step
                 px = self._grid_center - offset  # type: ignore[operator]
                 if px not in self.placed_buy_px_to_id and new_buys < self.max_new_per_loop:
@@ -176,7 +179,7 @@ class GridEngine:
                     await asyncio.sleep(self.op_spacing_sec)
             
             # 売りグリッド（追加）
-            for i in range(self.levels):
+            for i in range(1, self.levels + 1):
                 offset = i * self.step
                 px = self._grid_center + offset  # type: ignore[operator]
                 if px not in self.placed_sell_px_to_id and new_sells < self.max_new_per_loop:
@@ -196,6 +199,13 @@ class GridEngine:
         )
         
         try:
+            # 自己クロス防止: 反対サイドに同値があればスキップ
+            if side == OrderSide.BUY and price in self.placed_sell_px_to_id:
+                logger.debug("自己クロス回避: BUYをスキップ 価格=${:.1f}", price)
+                return
+            if side == OrderSide.SELL and price in self.placed_buy_px_to_id:
+                logger.debug("自己クロス回避: SELLをスキップ 価格=${:.1f}", price)
+                return
             order = await self.adapter.place_order(req)
             if side == OrderSide.BUY:
                 self.placed_buy_px_to_id[price] = order.id

@@ -92,6 +92,23 @@ class VolumeEngine:
         sell_price = float(Decimal(str(current_price)) + self.entry_offset_usd)
         logger.info("エントリー注文配置: 買い=${:.1f} 売り=${:.1f}", buy_price, sell_price)
         
+        # 板の事前取得（プリウォーム）: 起動直後の取得失敗で止まらないように
+        try:
+            warmed = False
+            for _ in range(5):
+                try:
+                    bid, ask = await self.adapter.get_best_bid_ask(self.contract_id)  # type: ignore[attr-defined]
+                except Exception:
+                    bid, ask = None, None
+                if bid is not None or ask is not None:
+                    warmed = True
+                    break
+                await asyncio.sleep(0.5)
+            if not warmed:
+                logger.warning("板の取得に失敗（プリウォーム未成功）。発注を遅延します。")
+        except Exception:
+            pass
+
         # 買い注文
         buy_order_req = OrderRequest(
             symbol=self.contract_id,
@@ -112,9 +129,25 @@ class VolumeEngine:
             time_in_force=TimeInForce.POST_ONLY  # ← MAKER注文（手数料リベート）
         )
         
-        # 注文を発注
-        buy_order = await self.adapter.place_order(buy_order_req)
-        sell_order = await self.adapter.place_order(sell_order_req)
+        # 注文を発注（strict makerエラー時は短期リトライ）
+        async def _place_with_retry(req: OrderRequest):
+            delay = 0.4
+            for i in range(5):
+                try:
+                    return await self.adapter.place_order(req)
+                except Exception as e:
+                    msg = str(e)
+                    if "strict maker: depth unavailable" in msg:
+                        logger.warning("発注待機（板未取得）: {} 回目", i + 1)
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 1.8, 2.0)
+                        continue
+                    raise
+            # 最後にもう一度試す（失敗時は例外を投げる）
+            return await self.adapter.place_order(req)
+
+        buy_order = await _place_with_retry(buy_order_req)
+        sell_order = await _place_with_retry(sell_order_req)
         
         self.buy_order_id = buy_order.id
         self.sell_order_id = sell_order.id

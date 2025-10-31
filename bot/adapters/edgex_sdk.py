@@ -4,7 +4,7 @@ import asyncio
 import os
 import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -29,6 +29,8 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         self.stark_private_key = stark_private_key
         self._client: Optional[EdgeXClient] = None
         self._market_rules: Dict[str, Dict[str, float]] = {}
+        # (best_bid, best_ask, ts_ms)
+        self._last_depth: Dict[str, Tuple[Optional[float], Optional[float], int]] = {}
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
@@ -78,68 +80,83 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         raise RuntimeError("ticker retry exhausted")
 
     async def get_best_bid_ask(self, symbol: str) -> tuple[float | None, float | None]:
-        """EdgeXの板: まずSDKのquote.get_depth、なければ公式公開API getDepth を使う。"""
-        # 1) SDKのquote.get_depthを優先
-        try:
-            if self._client is not None and hasattr(self._client, "quote"):
-                meth = getattr(self._client.quote, "get_depth", None)
-                if callable(meth):
-                    try:
-                        resp = await meth(contract_id=str(symbol))  # type: ignore[arg-type]
-                    except TypeError:
-                        resp = await meth(str(symbol))  # type: ignore[misc]
-                    data = resp.get("data") if isinstance(resp, dict) else resp
-                    if isinstance(data, dict):
-                        bids = data.get("bids") or []
-                        asks = data.get("asks") or []
-                        def _first_price(arr) -> float | None:
-                            try:
-                                if not arr:
-                                    return None
-                                x = arr[0]
-                                if isinstance(x, (list, tuple)):
-                                    return float(x[0])
-                                if isinstance(x, dict):
-                                    return float(x.get("price") or x.get("px") or x.get("0") or 0)
-                                return float(x)
-                            except Exception:
-                                return None
-                        bid_px = _first_price(bids)
-                        ask_px = _first_price(asks)
-                        if bid_px is not None or ask_px is not None:
-                            return bid_px, ask_px
-        except Exception:
-            pass
-
-        # 2) 公開API: /api/v1/public/quote/getDepth?contractId=...&level=15
-        base = self.base_url.rstrip("/")
-        url = f"{base}/api/v1/public/quote/getDepth"
-        params = {"contractId": str(symbol), "level": "15"}
-        try:
-            async with httpx.AsyncClient(timeout=8.0, headers={"Accept": "application/json"}) as client:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                data = r.json()
-                d = data.get("data") if isinstance(data, dict) else None
-                if not isinstance(d, dict):
-                    return None, None
-                bids = d.get("bids") or []
-                asks = d.get("asks") or []
-                def _first_price(arr) -> float | None:
-                    try:
-                        if not arr:
-                            return None
-                        x = arr[0]
-                        if isinstance(x, (list, tuple)):
-                            return float(x[0])
-                        if isinstance(x, dict):
-                            return float(x.get("price") or x.get("px") or x.get("0") or 0)
-                        return float(x)
-                    except Exception:
+        """EdgeXの板: SDK→HTTPの順で最大リトライ。成功時は短期キャッシュ。"""
+        def _extract_bba(container: Any) -> tuple[float | None, float | None]:
+            """Extract (bid, ask) from common depth shapes: dict or list-of-dict."""
+            def _px(arr) -> float | None:
+                try:
+                    if not arr:
                         return None
-                return _first_price(bids), _first_price(asks)
-        except Exception:
+                    x = arr[0]
+                    if isinstance(x, (list, tuple)):
+                        return float(x[0])
+                    if isinstance(x, dict):
+                        return float(x.get("price") or x.get("px") or x.get("0") or 0)
+                    return float(x)
+                except Exception:
+                    return None
+
+            d = None
+            if isinstance(container, dict):
+                d = container
+            elif isinstance(container, list) and container:
+                d = container[0] if isinstance(container[0], dict) else None
+            if not isinstance(d, dict):
+                return None, None
+            bids = d.get("bids") or d.get("buy") or d.get("Bid") or []
+            asks = d.get("asks") or d.get("sell") or d.get("Ask") or []
+            return _px(bids), _px(asks)
+
+        async def _first_from_sdk() -> tuple[float | None, float | None]:
+            try:
+                if self._client is not None and hasattr(self._client, "quote"):
+                    meth = getattr(self._client.quote, "get_depth", None)
+                    if callable(meth):
+                        try:
+                            resp = await meth(contract_id=str(symbol))  # type: ignore[arg-type]
+                        except TypeError:
+                            resp = await meth(str(symbol))  # type: ignore[misc]
+                        data = resp.get("data") if isinstance(resp, dict) else resp
+                        return _extract_bba(data)
+            except Exception:
+                return None, None
             return None, None
+
+        async def _first_from_http() -> tuple[float | None, float | None]:
+            base = self.base_url.rstrip("/")
+            url = f"{base}/api/v1/public/quote/getDepth"
+            params = {"contractId": str(symbol), "level": "15"}
+            try:
+                async with httpx.AsyncClient(timeout=8.0, headers={"Accept": "application/json"}) as client:
+                    r = await client.get(url, params=params)
+                    r.raise_for_status()
+                    body = r.json()
+                    data = body.get("data") if isinstance(body, dict) else None
+                    return _extract_bba(data)
+            except Exception:
+                return None, None
+
+        # リトライ（指数バックオフ）
+        backoff = 0.4
+        for _ in range(5):
+            bid, ask = await _first_from_sdk()
+            if bid is None and ask is None:
+                bid, ask = await _first_from_http()
+            # 正当性チェック
+            try:
+                if bid is not None and ask is not None and bid >= ask:
+                    bid, ask = None, None
+            except Exception:
+                pass
+
+            if bid is not None or ask is not None:
+                # キャッシュ
+                self._last_depth[str(symbol)] = (bid, ask, self._now_ms())
+                return bid, ask
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.8, 3.0)
+
+        return None, None
 
     async def _get_market_rules(self, contract_id: str) -> Dict[str, float]:
         """Fetch and cache market rules (size step, price tick, min size) for the contract.
@@ -315,9 +332,16 @@ class EdgeXSDKAdapter(ExchangeAdapter):
             except Exception:
                 pass
 
-        # ベストが取れない場合のフォールバック
+        # ベストが取れない場合のフォールバック（短期キャッシュを使用）
+        if best_bid is None or best_ask is None:
+            cached = self._last_depth.get(contract_id)
+            if cached:
+                cbid, cask, ts = cached
+                # 3秒以内のキャッシュなら採用
+                if self._now_ms() - ts <= 3000:
+                    best_bid, best_ask = cbid, cask
+        # それでも無ければ厳格モードなら中止
         if (best_bid is None or best_ask is None) and strict_maker:
-            # 厳格モードでは発注を中止（後で再試行）
             raise RuntimeError("strict maker: depth unavailable, skip order placement")
         if (best_bid is None or best_ask is None) and not strict_maker:
             try:

@@ -28,10 +28,15 @@ async def main() -> None:
     except Exception:
         # ファイル出力に失敗しても実行は継続（標準出力は残す）
         pass
-    with open("configs/edgex.yaml", "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    # 設定ファイルは任意（無ければ空dict）
+    try:
+        with open("configs/edgex.yaml", "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        cfg = {}
 
-    base_url = os.getenv("EDGEX_BASE_URL", cfg.get("base_url"))
+    # URLは未指定なら商用既定（変更不要なら設定しなくてOK）
+    base_url = os.getenv("EDGEX_BASE_URL") or cfg.get("base_url") or "https://pro.edgex.exchange"
     api_id = (
         os.getenv("EDGEX_ACCOUNT_ID")
         or os.getenv("EDGEX_API_ID")
@@ -44,7 +49,8 @@ async def main() -> None:
     contract_id_env = os.getenv("EDGEX_CONTRACT_ID")
     symbol_env = os.getenv("EDGEX_SYMBOL")
     symbol_cfg = cfg.get("symbol") or cfg.get("contract_id")
-    symbol = contract_id_env or symbol_env or symbol_cfg
+    # シンボル未指定ならBTC-PERPの既定ID（EdgeXの例: 10000001）
+    symbol = contract_id_env or symbol_env or symbol_cfg or "10000001"
 
     parsed = urlparse(base_url or "")
     if not parsed.scheme or not parsed.netloc:
@@ -53,6 +59,7 @@ async def main() -> None:
         raise SystemExit("EDGEX_BASE_URL がプレースホルダです。実際のAPIベースURLに置き換えてください。")
     logger.info("edgex base_url={}, symbol_param={}, symbol={}", base_url, symbol_param, symbol)
 
+    # ループ間隔は未指定なら2.5秒（稼働安定の既定値）
     poll_interval_raw = os.getenv("EDGEX_POLL_INTERVAL_SEC") or cfg.get("poll_interval_sec", 2.5)
     try:
         poll_interval = float(poll_interval_raw)

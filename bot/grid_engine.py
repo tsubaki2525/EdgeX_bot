@@ -81,6 +81,29 @@ class GridEngine:
         except Exception:
             self.max_new_per_loop = 0
 
+        # 価格追従（乖離補正）設定
+        try:
+            self.follow_enable = str(os.getenv("EDGEX_GRID_FOLLOW_ENABLE", "1")).lower() in ("1", "true", "yes")
+        except Exception:
+            self.follow_enable = True
+        try:
+            # X からの許容バンドを N ステップ分だけ広げる（例: 1 -> X+1*N までは許容）
+            self.follow_slack_steps = int(os.getenv("EDGEX_GRID_FOLLOW_SLACK_STEPS", "1"))
+        except Exception:
+            self.follow_slack_steps = 1
+        try:
+            # 1ループで寄せる最大本数（過度な再配置を抑制）
+            self.max_shift_per_loop = int(os.getenv("EDGEX_GRID_MAX_SHIFT_PER_LOOP", "1"))
+        except Exception:
+            self.max_shift_per_loop = 1
+
+    def _has_min_gap(self, side_map: Dict[float, str], px: float) -> bool:
+        """Return True if `px` is at least `self.step` away from all existing prices in `side_map`."""
+        for existing_price in side_map.keys():
+            if abs(existing_price - px) < self.step - 1e-9:
+                return False
+        return True
+
     async def run(self) -> None:
         await self.adapter.connect()
         self._running = True
@@ -159,7 +182,123 @@ class GridEngine:
         if self.initialized:
             need_buy_seed = len(self.placed_buy_px_to_id) == 0
             need_sell_seed = len(self.placed_sell_px_to_id) == 0
-            if not (need_buy_seed or need_sell_seed):
+            # 片側が空なら再シード（初期の挟み込みを回復）
+            if need_buy_seed or need_sell_seed:
+                buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
+                sell_targets = [float(mid_price) + (self.first_offset + i * self.step) for i in range(self.levels)]
+                logger.info("再配置: need_buy={} need_sell={} P={} X={} N={}", need_buy_seed, need_sell_seed, mid_price, self.first_offset, self.step)
+                # BUY再種まき
+                if need_buy_seed:
+                    new_buys = 0
+                    for px in buy_targets:
+                        if px <= 0:
+                            continue
+                        if px >= (mid_price - 1e-9):
+                            continue
+                        if px in self.placed_buy_px_to_id:
+                            continue
+                        if not self._has_min_gap(self.placed_buy_px_to_id, px):
+                            continue
+                        await self._place_order(OrderSide.BUY, px)
+                        new_buys += 1
+                        await asyncio.sleep(self.op_spacing_sec)
+                        if new_buys >= self.levels:
+                            break
+                # SELL再種まき
+                if need_sell_seed:
+                    new_sells = 0
+                    for px in sell_targets:
+                        if px <= (mid_price + 1e-9):
+                            continue
+                        if px in self.placed_sell_px_to_id:
+                            continue
+                        if not self._has_min_gap(self.placed_sell_px_to_id, px):
+                            continue
+                        await self._place_order(OrderSide.SELL, px)
+                        new_sells += 1
+                        await asyncio.sleep(self.op_spacing_sec)
+                        if new_sells >= self.levels:
+                            break
+                return
+
+            # 両サイドに1本以上ある場合: 追従（価格乖離の自動シフト）
+            if self.follow_enable and self.step > 0:
+
+                # BUY側: 近い買いが P-(X+slack*N) より遠くにあるなら、遠い買いを1本消して内側へ1ステップ寄せる
+                try:
+                    shifts = 0
+                    if self.placed_buy_px_to_id:
+                        nearest_buy = max(self.placed_buy_px_to_id.keys())  # 市場に最も近い買い
+                        desired_min_buy = float(mid_price) - (self.first_offset + self.follow_slack_steps * self.step)
+                        while nearest_buy < desired_min_buy - 1e-9 and shifts < self.max_shift_per_loop:
+                            if len(self.placed_buy_px_to_id) <= 0:
+                                break
+                            far_buy_px = min(self.placed_buy_px_to_id.keys())
+                            far_buy_id = self.placed_buy_px_to_id.pop(far_buy_px)
+                            try:
+                                await self.adapter.cancel_order(far_buy_id)
+                                logger.info("追従: 遠いBUYキャンセル px={}", far_buy_px)
+                            except Exception:
+                                logger.debug("追従: 遠いBUYキャンセル失敗(無視) id={} px={}", far_buy_id, far_buy_px)
+                            await asyncio.sleep(self.op_spacing_sec)
+
+                            new_buy_px = nearest_buy + self.step
+                            # 安全: 現在価格の内側には置かない
+                            if new_buy_px >= (mid_price - 1e-9):
+                                break
+                            if new_buy_px in self.placed_buy_px_to_id:
+                                nearest_buy = new_buy_px
+                                shifts += 1
+                                continue
+                            if not self._has_min_gap(self.placed_buy_px_to_id, new_buy_px):
+                                logger.debug("追従: BUY gap違反でスキップ new_px={}", new_buy_px)
+                                break
+                            await self._place_order(OrderSide.BUY, new_buy_px)
+                            nearest_buy = new_buy_px
+                            shifts += 1
+                            await asyncio.sleep(self.op_spacing_sec)
+                        if shifts:
+                            logger.debug("追従BUY: nearest={} desired_min={} shifts={}", nearest_buy, desired_min_buy, shifts)
+                except Exception as e:
+                    logger.debug("追従BUY処理スキップ: {}", e)
+
+                # SELL側: 近い売りが P+(X+slack*N) より遠くにあるなら、遠い売りを1本消して内側へ1ステップ寄せる
+                try:
+                    shifts = 0
+                    if self.placed_sell_px_to_id:
+                        nearest_sell = min(self.placed_sell_px_to_id.keys())  # 市場に最も近い売り
+                        desired_max_sell = float(mid_price) + (self.first_offset + self.follow_slack_steps * self.step)
+                        while nearest_sell > desired_max_sell + 1e-9 and shifts < self.max_shift_per_loop:
+                            if len(self.placed_sell_px_to_id) <= 0:
+                                break
+                            far_sell_px = max(self.placed_sell_px_to_id.keys())
+                            far_sell_id = self.placed_sell_px_to_id.pop(far_sell_px)
+                            try:
+                                await self.adapter.cancel_order(far_sell_id)
+                                logger.info("追従: 遠いSELLキャンセル px={}", far_sell_px)
+                            except Exception:
+                                logger.debug("追従: 遠いSELLキャンセル失敗(無視) id={} px={}", far_sell_id, far_sell_px)
+                            await asyncio.sleep(self.op_spacing_sec)
+
+                            new_sell_px = nearest_sell - self.step
+                            # 安全: 現在価格の内側には置かない
+                            if new_sell_px <= (mid_price + 1e-9):
+                                break
+                            if new_sell_px in self.placed_sell_px_to_id:
+                                nearest_sell = new_sell_px
+                                shifts += 1
+                                continue
+                            if not self._has_min_gap(self.placed_sell_px_to_id, new_sell_px):
+                                logger.debug("追従: SELL gap違反でスキップ new_px={}", new_sell_px)
+                                break
+                            await self._place_order(OrderSide.SELL, new_sell_px)
+                            nearest_sell = new_sell_px
+                            shifts += 1
+                            await asyncio.sleep(self.op_spacing_sec)
+                        if shifts:
+                            logger.debug("追従SELL: nearest={} desired_max={} shifts={}", nearest_sell, desired_max_sell, shifts)
+                except Exception as e:
+                    logger.debug("追従SELL処理スキップ: {}", e)
                 return
             buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
             sell_targets = [float(mid_price) + (self.first_offset + i * self.step) for i in range(self.levels)]
@@ -198,12 +337,6 @@ class GridEngine:
                         break
             return
 
-        def _has_min_gap(side_map: Dict[float, str], px: float) -> bool:
-            for opx in side_map.keys():
-                if abs(opx - px) < self.step - 1e-9:
-                    return False
-            return True
-
         # 候補を作る
         buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
         sell_targets = [float(mid_price) + (self.first_offset + i * self.step) for i in range(self.levels)]
@@ -225,7 +358,7 @@ class GridEngine:
             if px in self.placed_buy_px_to_id:
                 logger.debug("skip(init BUY): already placed px={}", px)
                 continue
-            if not _has_min_gap(self.placed_buy_px_to_id, px):
+            if not self._has_min_gap(self.placed_buy_px_to_id, px):
                 logger.debug("skip(init BUY): gap < N at px={}", px)
                 continue
             if self.max_new_per_loop and new_buys >= self.max_new_per_loop:
@@ -239,7 +372,7 @@ class GridEngine:
             if px in self.placed_sell_px_to_id:
                 logger.debug("skip(init SELL): already placed px={}", px)
                 continue
-            if not _has_min_gap(self.placed_sell_px_to_id, px):
+            if not self._has_min_gap(self.placed_sell_px_to_id, px):
                 logger.debug("skip(init SELL): gap < N at px={}", px)
                 continue
             if px <= (mid_price + 1e-9):

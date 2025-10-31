@@ -245,19 +245,19 @@ class GridEngine:
             for px in need_buys:
                 if self.max_new_per_loop and add_buys >= self.max_new_per_loop:
                     break
-                    await self._place_order(OrderSide.BUY, px)
+                await self._place_order(OrderSide.BUY, px)
                 add_buys += 1
-                    await asyncio.sleep(self.op_spacing_sec)
+                await asyncio.sleep(self.op_spacing_sec)
             
             for px in need_sells:
                 if self.max_new_per_loop and add_sells >= self.max_new_per_loop:
                     break
-                    await self._place_order(OrderSide.SELL, px)
+                await self._place_order(OrderSide.SELL, px)
                 add_sells += 1
-                    await asyncio.sleep(self.op_spacing_sec)
+                await asyncio.sleep(self.op_spacing_sec)
             
             if not self.initialized:
-            self.initialized = True
+                self.initialized = True
                 logger.info("BIN: 初期配置完了 買い{}本 売り{}本", len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
             return
 
@@ -469,9 +469,9 @@ class GridEngine:
                 continue
             if self.max_new_per_loop and new_buys >= self.max_new_per_loop:
                 break
-                    await self._place_order(OrderSide.BUY, px)
+            await self._place_order(OrderSide.BUY, px)
             new_buys += 1
-                    await asyncio.sleep(self.op_spacing_sec)
+            await asyncio.sleep(self.op_spacing_sec)
             
         # 売り配置（P＋X より内側は生成しない設計だが、念のためチェック）
         for px in sell_targets:
@@ -486,9 +486,9 @@ class GridEngine:
                 continue
             if self.max_new_per_loop and new_sells >= self.max_new_per_loop:
                 break
-                    await self._place_order(OrderSide.SELL, px)
+            await self._place_order(OrderSide.SELL, px)
             new_sells += 1
-                    await asyncio.sleep(self.op_spacing_sec)
+            await asyncio.sleep(self.op_spacing_sec)
             
         if not self.initialized:
             self.initialized = True

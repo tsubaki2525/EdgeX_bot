@@ -60,27 +60,30 @@ async def main() -> None:
     logger.info("edgex base_url={}, symbol_param={}, symbol={}", base_url, symbol_param, symbol)
 
     # === GAS(Web)認証を強制: シートA列のIDに一致しなければ起動拒否 ===
-    # 設定ファイル configs/edgex.yaml に auth_url を用意（例: https://script.google.com/macros/s/xxx/exec）
+    # auth_url は設定が無い場合、既定であなたのデプロイURLへ問い合わせます
     import httpx  # type: ignore
-    auth_url = cfg.get("auth_url")
-    if not auth_url:
-        raise SystemExit("auth_url が未設定です（configs/edgex.yaml に GAS のWebアプリURLを設定してください）")
+    default_auth_url = "https://script.google.com/macros/s/AKfycbz5qTzBD62-FRdRwA0qBzxPy6fGj3fuuRwx4fQ0cNj-qmLtWwOqo9UZDnc0tv31ezMl/exec"
+    auth_url = cfg.get("auth_url") or default_auth_url
     try:
-        params = {"accountId": str(api_id)}
+        acct_str = str(api_id)
+        logger.info("認証チェック開始: url={} account_id={}", auth_url, acct_str)
+        params = {"accountId": acct_str}
         timeout = httpx.Timeout(6.0)
         async with httpx.AsyncClient(timeout=timeout, headers={"Accept": "application/json"}) as client:
             r = await client.get(auth_url, params=params)
             r.raise_for_status()
             body = r.json()
-            # 期待: {"allowed": true}
             allowed_raw = body.get("allowed") if isinstance(body, dict) else None
             allowed = str(allowed_raw).lower() in ("1", "true", "yes")
             if not allowed:
-                raise SystemExit(f"このアカウントは許可されていません（account_id={api_id}）")
+                logger.error("認証されていないアカウントIDです: account_id={} / 認証してください: {}?accountId={}", acct_str, auth_url, acct_str)
+                raise SystemExit(f"認証NG: account_id={acct_str}")
+        logger.info("認証OK: account_id={}", acct_str)
     except SystemExit:
         raise
     except Exception as e:
-        raise SystemExit(f"認証サーバへの接続/検証に失敗しました: {e}")
+        logger.warning("認証サーバへの接続/検証に失敗しました: {} / 認証してください: {}?accountId={}", e, auth_url, str(api_id))
+        raise SystemExit(f"認証サーバ接続失敗: {e}")
 
     # ループ間隔は未指定なら2.5秒（稼働安定の既定値）
     poll_interval_raw = os.getenv("EDGEX_POLL_INTERVAL_SEC") or cfg.get("poll_interval_sec", 2.5)

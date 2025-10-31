@@ -49,9 +49,10 @@ class GridEngine:
 
         # レート制限回避のための遅延時間調整
         try:
-            self.op_spacing_sec = float(os.getenv("EDGEX_GRID_OP_SPACING_SEC", "1.2"))
+            # シンプル高速モードでは既定を短めにする（必要なら環境変数で上書き）
+            self.op_spacing_sec = float(os.getenv("EDGEX_GRID_OP_SPACING_SEC", "0.4"))
         except Exception:
-            self.op_spacing_sec = 1.2
+            self.op_spacing_sec = 0.4
 
         # 初回配置済みフラグ（複数回はfirst_offsetは適用しない一度だけ）
         self.initialized = False
@@ -81,11 +82,18 @@ class GridEngine:
         except Exception:
             self.max_new_per_loop = 0
 
-        # 価格追従（乖離補正）設定
+        # シンプルモード（余計な挙動を排し、配置を高速化）
         try:
-            self.follow_enable = str(os.getenv("EDGEX_GRID_FOLLOW_ENABLE", "1")).lower() in ("1", "true", "yes")
+            self.simple_mode = str(os.getenv("EDGEX_GRID_SIMPLE", "1")).lower() in ("1", "true", "yes")
         except Exception:
-            self.follow_enable = True
+            self.simple_mode = True
+
+        # 価格追従（乖離補正）設定（シンプルモードでは既定OFF）
+        try:
+            default_follow = "0" if self.simple_mode else "1"
+            self.follow_enable = str(os.getenv("EDGEX_GRID_FOLLOW_ENABLE", default_follow)).lower() in ("1", "true", "yes")
+        except Exception:
+            self.follow_enable = (not self.simple_mode)
         try:
             # X からの許容バンドを N ステップ分だけ広げる（例: 1 -> X+1*N までは許容）
             self.follow_slack_steps = int(os.getenv("EDGEX_GRID_FOLLOW_SLACK_STEPS", "1"))
@@ -222,6 +230,7 @@ class GridEngine:
                 return
 
             # 両サイドに1本以上ある場合: 追従（価格乖離の自動シフト）
+            # 任意: 価格追従（シンプルモードでは既定OFF）
             if self.follow_enable and self.step > 0:
 
                 # BUY側: 近い買いが P-(X+slack*N) より遠くにあるなら、遠い買いを1本消して内側へ1ステップ寄せる
@@ -299,78 +308,63 @@ class GridEngine:
                             logger.debug("追従SELL: nearest={} desired_max={} shifts={}", nearest_sell, desired_max_sell, shifts)
                 except Exception as e:
                     logger.debug("追従SELL処理スキップ: {}", e)
-                # フォロー後に本数不足があれば外側に補充（levels維持）
-                try:
-                    # 片側あたりの新規上限を考慮
-                    add_buys = 0
-                    add_sells = 0
-                    # BUY不足: 最外側(min)から外側へ足す
-                    while len(self.placed_buy_px_to_id) < self.levels:
-                        if not self.placed_buy_px_to_id:
+            # フォローの有無に関係なく、本数不足があれば外側に補充（levels維持）
+            try:
+                # 片側あたりの新規上限を考慮
+                add_buys = 0
+                add_sells = 0
+                # BUY不足: 最外側(min)から外側へ足す（失敗時はさらに一段外へ最大3回リトライ）
+                while len(self.placed_buy_px_to_id) < self.levels:
+                    if not self.placed_buy_px_to_id:
+                        break
+                    cand = min(self.placed_buy_px_to_id.keys()) - self.step
+                    attempts = 0
+                    placed = False
+                    while cand <= (mid_price - 1e-9) and self._has_min_gap(self.placed_buy_px_to_id, cand) and attempts < 3:
+                        if self.max_new_per_loop and add_buys >= self.max_new_per_loop:
                             break
-                        next_buy = min(self.placed_buy_px_to_id.keys()) - self.step
-                        if next_buy <= (mid_price - 1e-9) and self._has_min_gap(self.placed_buy_px_to_id, next_buy):
-                            if self.max_new_per_loop and add_buys >= self.max_new_per_loop:
-                                break
-                            await self._place_order(OrderSide.BUY, next_buy)
+                        before = set(self.placed_buy_px_to_id.keys())
+                        await self._place_order(OrderSide.BUY, cand)
+                        await asyncio.sleep(self.op_spacing_sec)
+                        after = set(self.placed_buy_px_to_id.keys())
+                        if cand in after and cand not in before:
+                            placed = True
                             add_buys += 1
-                            await asyncio.sleep(self.op_spacing_sec)
-                        else:
                             break
-                    # SELL不足: 最外側(max)から外側へ足す
-                    while len(self.placed_sell_px_to_id) < self.levels:
-                        if not self.placed_sell_px_to_id:
+                        # 価格が食い込み等で弾かれた場合はさらに外側へ
+                        cand -= self.step
+                        attempts += 1
+                    if not placed:
+                        break
+                # SELL不足: 最外側(max)から外側へ足す（失敗時はさらに一段外へ最大3回リトライ）
+                while len(self.placed_sell_px_to_id) < self.levels:
+                    if not self.placed_sell_px_to_id:
+                        break
+                    cand = max(self.placed_sell_px_to_id.keys()) + self.step
+                    attempts = 0
+                    placed = False
+                    while cand >= (mid_price + 1e-9) and self._has_min_gap(self.placed_sell_px_to_id, cand) and attempts < 3:
+                        if self.max_new_per_loop and add_sells >= self.max_new_per_loop:
                             break
-                        next_sell = max(self.placed_sell_px_to_id.keys()) + self.step
-                        if next_sell >= (mid_price + 1e-9) and self._has_min_gap(self.placed_sell_px_to_id, next_sell):
-                            if self.max_new_per_loop and add_sells >= self.max_new_per_loop:
-                                break
-                            await self._place_order(OrderSide.SELL, next_sell)
+                        before = set(self.placed_sell_px_to_id.keys())
+                        await self._place_order(OrderSide.SELL, cand)
+                        await asyncio.sleep(self.op_spacing_sec)
+                        after = set(self.placed_sell_px_to_id.keys())
+                        if cand in after and cand not in before:
+                            placed = True
                             add_sells += 1
-                            await asyncio.sleep(self.op_spacing_sec)
-                        else:
                             break
-                    if add_buys or add_sells:
-                        logger.debug("levels補充: add_buys={} add_sells={} now buy={} sell={}", add_buys, add_sells, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
-                except Exception as e:
-                    logger.debug("levels補充スキップ: {}", e)
-                return
-            buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
-            sell_targets = [float(mid_price) + (self.first_offset + i * self.step) for i in range(self.levels)]
-            logger.info("再配置: need_buy={} need_sell={} P={} X={} N={}", need_buy_seed, need_sell_seed, mid_price, self.first_offset, self.step)
-            # BUY再種まき
-            if need_buy_seed:
-                new_buys = 0
-                for px in buy_targets:
-                    if px <= 0:
-                        continue
-                    if px >= (mid_price - 1e-9):
-                        continue
-                    if px in self.placed_buy_px_to_id:
-                        continue
-                    if not _has_min_gap(self.placed_buy_px_to_id, px):
-                        continue
-                    await self._place_order(OrderSide.BUY, px)
-                    new_buys += 1
-                    await asyncio.sleep(self.op_spacing_sec)
-                    if new_buys >= self.levels:
+                        # 価格が食い込み等で弾かれた場合はさらに外側へ
+                        cand += self.step
+                        attempts += 1
+                    if not placed:
                         break
-            # SELL再種まき
-            if need_sell_seed:
-                new_sells = 0
-                for px in sell_targets:
-                    if px <= (mid_price + 1e-9):
-                        continue
-                    if px in self.placed_sell_px_to_id:
-                        continue
-                    if not _has_min_gap(self.placed_sell_px_to_id, px):
-                        continue
-                    await self._place_order(OrderSide.SELL, px)
-                    new_sells += 1
-                    await asyncio.sleep(self.op_spacing_sec)
-                    if new_sells >= self.levels:
-                        break
+                if add_buys or add_sells:
+                    logger.debug("levels補充: add_buys={} add_sells={} now buy={} sell={}", add_buys, add_sells, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
+            except Exception as e:
+                logger.debug("levels補充スキップ: {}", e)
             return
+            # 上記でreturnしているため以降は不要な重複ロジックを削除
 
         # 候補を作る
         buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
@@ -398,10 +392,10 @@ class GridEngine:
                 continue
             if self.max_new_per_loop and new_buys >= self.max_new_per_loop:
                 break
-            await self._place_order(OrderSide.BUY, px)
+                    await self._place_order(OrderSide.BUY, px)
             new_buys += 1
-            await asyncio.sleep(self.op_spacing_sec)
-
+                    await asyncio.sleep(self.op_spacing_sec)
+            
         # 売り配置（P＋X より内側は生成しない設計だが、念のためチェック）
         for px in sell_targets:
             if px in self.placed_sell_px_to_id:
@@ -415,7 +409,7 @@ class GridEngine:
                 continue
             if self.max_new_per_loop and new_sells >= self.max_new_per_loop:
                 break
-            await self._place_order(OrderSide.SELL, px)
+                    await self._place_order(OrderSide.SELL, px)
             new_sells += 1
                     await asyncio.sleep(self.op_spacing_sec)
             
@@ -436,31 +430,32 @@ class GridEngine:
         )
         
         try:
-            # 同サイドの取引所OPENともN間隔を確認（丸め差異を吸収）
-            try:
-                active = await self.adapter.list_active_orders(self.symbol)
-            except Exception:
-                active = []
-            # 候補と既存価格の距離がN未満ならスキップ
-            def _extract_px(row: dict) -> float | None:
+            # シンプルモード: 取引所全体の同サイドOPENとの距離チェックを省略（高速化）
+            if not self.simple_mode:
                 try:
-                    raw = row.get("price") or row.get("px") or row.get("0")
-                    return float(raw) if raw is not None else None
+                    active = await self.adapter.list_active_orders(self.symbol)
                 except Exception:
-                    return None
-            for row in (active or []):
-                if not isinstance(row, dict):
-                    continue
-                # サイド判定（無ければスキップ）
-                s = str(row.get("side") or row.get("orderSide") or "").upper()
-                if (side == OrderSide.BUY and s not in ("BUY", "LONG")) or (side == OrderSide.SELL and s not in ("SELL", "SHORT")):
-                    continue
-                apx = _extract_px(row)
-                if apx is None:
-                    continue
-                if abs(apx - price) < (self.step - 1e-9):
-                    logger.debug("N間隔未満のためスキップ: side={} cand={} exist={}", side, price, apx)
-                    return
+                    active = []
+                # 候補と既存価格の距離がN未満ならスキップ
+                def _extract_px(row: dict) -> float | None:
+                    try:
+                        raw = row.get("price") or row.get("px") or row.get("0")
+                        return float(raw) if raw is not None else None
+                    except Exception:
+                        return None
+                for row in (active or []):
+                    if not isinstance(row, dict):
+                        continue
+                    # サイド判定（無ければスキップ）
+                    s = str(row.get("side") or row.get("orderSide") or "").upper()
+                    if (side == OrderSide.BUY and s not in ("BUY", "LONG")) or (side == OrderSide.SELL and s not in ("SELL", "SHORT")):
+                        continue
+                    apx = _extract_px(row)
+                    if apx is None:
+                        continue
+                    if abs(apx - price) < (self.step - 1e-9):
+                        logger.debug("N間隔未満のためスキップ: side={} cand={} exist={}", side, price, apx)
+                        return
 
             # 自己クロス防止: 反対サイドに同値があればスキップ
             if side == OrderSide.BUY and price in self.placed_sell_px_to_id:

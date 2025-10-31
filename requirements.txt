@@ -12,3 +12,5 @@ ecdsa
 starknet_py
 edgex-python-sdk
 requests
+gspread
+google-auth

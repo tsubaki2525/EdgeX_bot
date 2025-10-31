@@ -59,6 +59,51 @@ async def main() -> None:
         raise SystemExit("EDGEX_BASE_URL がプレースホルダです。実際のAPIベースURLに置き換えてください。")
     logger.info("edgex base_url={}, symbol_param={}, symbol={}", base_url, symbol_param, symbol)
 
+    # スプレッドシート許可リストで口座縛り（任意機能）
+    # 環境変数:
+    #  - SHEET_CREDENTIALS_JSON: GoogleサービスアカウントJSONファイルのパス
+    #  - SHEET_ALLOWED_SPREADSHEET_ID: スプレッドシートID
+    #  - SHEET_ALLOWED_RANGE: 読み取りレンジ（既定: "A:A"、シート名付き可 例: "Allowlist!A:A"）
+    try:
+        creds_path = os.getenv("SHEET_CREDENTIALS_JSON")
+        sheet_id = os.getenv("SHEET_ALLOWED_SPREADSHEET_ID")
+        sheet_range = os.getenv("SHEET_ALLOWED_RANGE", "A:A")
+        if creds_path and sheet_id:
+            try:
+                import gspread  # type: ignore
+                gc = gspread.service_account(filename=creds_path)
+                sh = gc.open_by_key(sheet_id)
+                # 範囲にシート名が無ければ先頭シート名を付与
+                range_name = sheet_range
+                if "!" not in range_name:
+                    range_name = f"{sh.sheet1.title}!{range_name}"
+                resp = sh.values_get(range_name)
+                ids = set()
+                for row in resp.get("values", []) or []:
+                    if not row:
+                        continue
+                    v = str(row[0]).strip()
+                    if v:
+                        ids.add(v)
+                if not ids:
+                    logger.warning("許可リストが空です。全拒否に該当します range={}", range_name)
+                acct = str(api_id)
+                if acct not in ids:
+                    raise SystemExit(f"このアカウントは許可されていません（account_id={acct}）")
+                logger.info("許可リスト認証OK: account_id={} (rows={})", acct, len(ids))
+            except SystemExit:
+                raise
+            except Exception as e:
+                # 設定されているが読めない場合は安全側で停止
+                raise SystemExit(f"許可リストの読み取りに失敗しました: {e}")
+        else:
+            logger.debug("許可リスト連携は無効（環境未設定）")
+    except SystemExit:
+        raise
+    except Exception:
+        # 予期せぬ例外は続行させず安全側終了
+        raise
+
     # ループ間隔は未指定なら2.5秒（稼働安定の既定値）
     poll_interval_raw = os.getenv("EDGEX_POLL_INTERVAL_SEC") or cfg.get("poll_interval_sec", 2.5)
     try:

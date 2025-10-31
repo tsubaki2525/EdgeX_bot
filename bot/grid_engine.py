@@ -193,16 +193,18 @@ class GridEngine:
 
         # === BIN固定モード: 常に絶対N刻みの価格帯に合わせる（追従/約定イベントに依存しない） ===
         if self.bin_mode:
-            # 基準ビンを算出
+            # 中心を「stepの整数倍」に丸める（例: step=100, P=100,050 → center=100,100）
             try:
-                lower_base = (int(float(mid_price) // self.step)) * self.step  # P以下の最近接ビン
+                center_units = round(float(mid_price) / self.step)
+                center = float(center_units * self.step)
             except Exception:
-                lower_base = float(mid_price)
-            upper_base = lower_base + self.step                              # P以上の最近接ビン
+                center = float(mid_price)
 
-            # オフセットは使わず（=0）純粋にビンで levels 本ずつ
-            buy_targets = [lower_base - i * self.step for i in range(0, self.levels)]
-            sell_targets = [upper_base + i * self.step for i in range(0, self.levels)]
+            # 0段（centerそのもの）は置かない。各サイド1..levels段を配置
+            # 例: step=100, levels=5, center=100,000 →
+            #   BUY: 99,500..99,900 / SELL: 100,100..100,500
+            buy_targets = [center - k * self.step for k in range(self.levels, 0, -1)]
+            sell_targets = [center + k * self.step for k in range(1, self.levels + 1)]
 
             target_buy_set = set(buy_targets)
             target_sell_set = set(sell_targets)

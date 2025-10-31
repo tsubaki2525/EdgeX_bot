@@ -392,9 +392,9 @@ class GridEngine:
                 continue
             if self.max_new_per_loop and new_buys >= self.max_new_per_loop:
                 break
-                    await self._place_order(OrderSide.BUY, px)
+            await self._place_order(OrderSide.BUY, px)
             new_buys += 1
-                    await asyncio.sleep(self.op_spacing_sec)
+            await asyncio.sleep(self.op_spacing_sec)
             
         # 売り配置（P＋X より内側は生成しない設計だが、念のためチェック）
         for px in sell_targets:
@@ -409,9 +409,9 @@ class GridEngine:
                 continue
             if self.max_new_per_loop and new_sells >= self.max_new_per_loop:
                 break
-                    await self._place_order(OrderSide.SELL, px)
+            await self._place_order(OrderSide.SELL, px)
             new_sells += 1
-                    await asyncio.sleep(self.op_spacing_sec)
+            await asyncio.sleep(self.op_spacing_sec)
             
         if not self.initialized:
             self.initialized = True

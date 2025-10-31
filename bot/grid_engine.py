@@ -299,6 +299,41 @@ class GridEngine:
                             logger.debug("追従SELL: nearest={} desired_max={} shifts={}", nearest_sell, desired_max_sell, shifts)
                 except Exception as e:
                     logger.debug("追従SELL処理スキップ: {}", e)
+                # フォロー後に本数不足があれば外側に補充（levels維持）
+                try:
+                    # 片側あたりの新規上限を考慮
+                    add_buys = 0
+                    add_sells = 0
+                    # BUY不足: 最外側(min)から外側へ足す
+                    while len(self.placed_buy_px_to_id) < self.levels:
+                        if not self.placed_buy_px_to_id:
+                            break
+                        next_buy = min(self.placed_buy_px_to_id.keys()) - self.step
+                        if next_buy <= (mid_price - 1e-9) and self._has_min_gap(self.placed_buy_px_to_id, next_buy):
+                            if self.max_new_per_loop and add_buys >= self.max_new_per_loop:
+                                break
+                            await self._place_order(OrderSide.BUY, next_buy)
+                            add_buys += 1
+                            await asyncio.sleep(self.op_spacing_sec)
+                        else:
+                            break
+                    # SELL不足: 最外側(max)から外側へ足す
+                    while len(self.placed_sell_px_to_id) < self.levels:
+                        if not self.placed_sell_px_to_id:
+                            break
+                        next_sell = max(self.placed_sell_px_to_id.keys()) + self.step
+                        if next_sell >= (mid_price + 1e-9) and self._has_min_gap(self.placed_sell_px_to_id, next_sell):
+                            if self.max_new_per_loop and add_sells >= self.max_new_per_loop:
+                                break
+                            await self._place_order(OrderSide.SELL, next_sell)
+                            add_sells += 1
+                            await asyncio.sleep(self.op_spacing_sec)
+                        else:
+                            break
+                    if add_buys or add_sells:
+                        logger.debug("levels補充: add_buys={} add_sells={} now buy={} sell={}", add_buys, add_sells, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
+                except Exception as e:
+                    logger.debug("levels補充スキップ: {}", e)
                 return
             buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
             sell_targets = [float(mid_price) + (self.first_offset + i * self.step) for i in range(self.levels)]
@@ -382,8 +417,8 @@ class GridEngine:
                 break
             await self._place_order(OrderSide.SELL, px)
             new_sells += 1
-            await asyncio.sleep(self.op_spacing_sec)
-
+                    await asyncio.sleep(self.op_spacing_sec)
+            
         if not self.initialized:
             self.initialized = True
             logger.info("初回グリッド配置完了: 買い{}本 売り{}本", 

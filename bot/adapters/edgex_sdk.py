@@ -321,16 +321,20 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         strict_maker = str(os.getenv("EDGEX_STRICT_MAKER", "true")).lower() in ("1", "true", "yes")
 
         orig_price_before_guard = price
-        if order.side == OrderSide.BUY and best_ask is not None:
-            try:
-                price = min(price, float(Decimal(str(best_ask)) - Decimal(str(tick_val))))
-            except Exception:
-                pass
-        elif order.side == OrderSide.SELL and best_bid is not None:
-            try:
-                price = max(price, float(Decimal(str(best_bid)) + Decimal(str(tick_val))))
-            except Exception:
-                pass
+        maker_mode = str(os.getenv("EDGEX_MAKER_MODE", "validate")).lower()  # validate | clamp
+        # validate: 価格はそのまま（丸めのみ）。食い込みならエラー
+        # clamp: best±tickへ寄せる（従来動作）
+        if maker_mode == "clamp":
+            if order.side == OrderSide.BUY and best_ask is not None:
+                try:
+                    price = min(price, float(Decimal(str(best_ask)) - Decimal(str(tick_val))))
+                except Exception:
+                    pass
+            elif order.side == OrderSide.SELL and best_bid is not None:
+                try:
+                    price = max(price, float(Decimal(str(best_bid)) + Decimal(str(tick_val))))
+                except Exception:
+                    pass
 
         # ベストが取れない場合のフォールバック（短期キャッシュを使用）
         if best_bid is None or best_ask is None:
@@ -343,15 +347,12 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         # それでも無ければ厳格モードなら中止
         if (best_bid is None or best_ask is None) and strict_maker:
             raise RuntimeError("strict maker: depth unavailable, skip order placement")
-        if (best_bid is None or best_ask is None) and not strict_maker:
-            try:
-                t = await self.get_ticker(contract_id)
-                if order.side == OrderSide.BUY:
-                    price = min(price, float(Decimal(str(t.price)) - Decimal(str(tick_val))))
-                else:
-                    price = max(price, float(Decimal(str(t.price)) + Decimal(str(tick_val))))
-            except Exception:
-                pass
+        # validateモードでは、板がある時に食い込みならエラーにして呼び出し側でスキップ/再試行
+        if maker_mode == "validate" and best_bid is not None and best_ask is not None:
+            if order.side == OrderSide.BUY and price >= float(best_ask):
+                raise RuntimeError("maker validate: buy price would take (price>=best_ask)")
+            if order.side == OrderSide.SELL and price <= float(best_bid):
+                raise RuntimeError("maker validate: sell price would take (price<=best_bid)")
 
         # 刻みへ最終スナップ（サイドに応じて受動側へ寄せる）
         try:
@@ -397,7 +398,8 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                 extra_params["order_type"] = "LIMIT_MAKER"
 
         logger.debug(
-            "maker_guard: side={} orig_price={} best_bid={} best_ask={} tick={} final_price={} post_only={} strict={}",
+            "maker_guard: mode={} side={} orig_price={} best_bid={} best_ask={} tick={} final_price={} post_only={} strict={}",
+            maker_mode,
             order.side,
             orig_price_before_guard,
             best_bid,

@@ -1,4 +1,6 @@
 base_url: https://pro.edgex.exchange
+# 認証(GAS)エンドポイント
+auth_url: https://script.google.com/macros/s/AKfycbyyOSgge8sKTYBNt2EAOwc7dKMM45npOaKGGGRVySKFddrp-0IdjCc_C-qDrxwRZJt8fg/exec
 # L2クレデンシャル
 api_id: "YOUR_ACCOUNT_ID"
 api_key: "YOUR_L2_PRIVATE_KEY"

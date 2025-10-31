@@ -78,26 +78,58 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         raise RuntimeError("ticker retry exhausted")
 
     async def get_best_bid_ask(self, symbol: str) -> tuple[float | None, float | None]:
-        """Return (best_bid, best_ask) from public depth. None if unavailable."""
+        """EdgeXの板: まずSDKのquote.get_depth、なければ公式公開API getDepth を使う。"""
+        # 1) SDKのquote.get_depthを優先
+        try:
+            if self._client is not None and hasattr(self._client, "quote"):
+                meth = getattr(self._client.quote, "get_depth", None)
+                if callable(meth):
+                    try:
+                        resp = await meth(contract_id=str(symbol))  # type: ignore[arg-type]
+                    except TypeError:
+                        resp = await meth(str(symbol))  # type: ignore[misc]
+                    data = resp.get("data") if isinstance(resp, dict) else resp
+                    if isinstance(data, dict):
+                        bids = data.get("bids") or []
+                        asks = data.get("asks") or []
+                        def _first_price(arr) -> float | None:
+                            try:
+                                if not arr:
+                                    return None
+                                x = arr[0]
+                                if isinstance(x, (list, tuple)):
+                                    return float(x[0])
+                                if isinstance(x, dict):
+                                    return float(x.get("price") or x.get("px") or x.get("0") or 0)
+                                return float(x)
+                            except Exception:
+                                return None
+                        bid_px = _first_price(bids)
+                        ask_px = _first_price(asks)
+                        if bid_px is not None or ask_px is not None:
+                            return bid_px, ask_px
+        except Exception:
+            pass
+
+        # 2) 公開API: /api/v1/public/quote/getDepth?contractId=...&level=15
         base = self.base_url.rstrip("/")
         url = f"{base}/api/v1/public/quote/getDepth"
         params = {"contractId": str(symbol), "level": "15"}
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=8.0, headers={"Accept": "application/json"}) as client:
                 r = await client.get(url, params=params)
                 r.raise_for_status()
                 data = r.json()
                 d = data.get("data") if isinstance(data, dict) else None
                 if not isinstance(d, dict):
                     return None, None
-                bids = d.get("bids") or d.get("buy") or d.get("Bid") or []
-                asks = d.get("asks") or d.get("sell") or d.get("Ask") or []
+                bids = d.get("bids") or []
+                asks = d.get("asks") or []
                 def _first_price(arr) -> float | None:
                     try:
                         if not arr:
                             return None
                         x = arr[0]
-                        # common formats: [price, size], {"price":..., "size":...}
                         if isinstance(x, (list, tuple)):
                             return float(x[0])
                         if isinstance(x, dict):

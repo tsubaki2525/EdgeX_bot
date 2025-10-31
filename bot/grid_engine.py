@@ -88,6 +88,13 @@ class GridEngine:
         except Exception:
             self.simple_mode = True
 
+        # ビン固定モード: 価格を N 刻みの絶対グリッドに揃える（例: 110000, 110100, 110200 ...）
+        # ループ毎に現在価格から目標ビン集合を作り、差分で発注/取消のみ行う
+        try:
+            self.bin_mode = str(os.getenv("EDGEX_GRID_BIN_MODE", "1")).lower() in ("1", "true", "yes")
+        except Exception:
+            self.bin_mode = True
+
         # 価格追従（乖離補正）設定（シンプルモードでは既定OFF）
         try:
             default_follow = "0" if self.simple_mode else "1"
@@ -182,6 +189,70 @@ class GridEngine:
         既に置いてある価格はスキップ。自サイドの最も近い注文とN未満にならないようにする。
         """
         if self.step <= 0:
+            return
+
+        # === BIN固定モード: 常に絶対N刻みの価格帯に合わせる（追従/約定イベントに依存しない） ===
+        if self.bin_mode:
+            # 基準ビンを算出
+            try:
+                lower_base = (int(float(mid_price) // self.step)) * self.step  # P以下の最近接ビン
+            except Exception:
+                lower_base = float(mid_price)
+            upper_base = lower_base + self.step                              # P以上の最近接ビン
+
+            # オフセットは使わず（=0）純粋にビンで levels 本ずつ
+            buy_targets = [lower_base - i * self.step for i in range(0, self.levels)]
+            sell_targets = [upper_base + i * self.step for i in range(0, self.levels)]
+
+            target_buy_set = set(buy_targets)
+            target_sell_set = set(sell_targets)
+
+            # 取消対象: 目標集合から外れている自ボットの注文
+            cancel_ids: list[tuple[str, float]] = []
+            for px, oid in list(self.placed_buy_px_to_id.items()):
+                if px not in target_buy_set:
+                    cancel_ids.append((oid, px))
+            for px, oid in list(self.placed_sell_px_to_id.items()):
+                if px not in target_sell_set:
+                    cancel_ids.append((oid, px))
+            # キャンセル（過度な連発を避けるため最大levels本）
+            for oid, px in cancel_ids[: max(1, self.levels)]:
+                try:
+                    await self.adapter.cancel_order(oid)
+                    if px in self.placed_buy_px_to_id and self.placed_buy_px_to_id.get(px) == oid:
+                        del self.placed_buy_px_to_id[px]
+                    if px in self.placed_sell_px_to_id and self.placed_sell_px_to_id.get(px) == oid:
+                        del self.placed_sell_px_to_id[px]
+                    logger.info("BIN: 目標外をキャンセル id={} px={}", oid, px)
+                except Exception:
+                    logger.debug("BIN: キャンセル失敗(無視) id={} px={}", oid, px)
+                await asyncio.sleep(self.op_spacing_sec)
+
+            # 発注対象: 目標集合−現状
+            need_buys = [px for px in buy_targets if px not in self.placed_buy_px_to_id]
+            need_sells = [px for px in sell_targets if px not in self.placed_sell_px_to_id]
+
+            # 片側あたりの新規上限
+            add_buys = 0
+            add_sells = 0
+
+            for px in need_buys:
+                if self.max_new_per_loop and add_buys >= self.max_new_per_loop:
+                    break
+                await self._place_order(OrderSide.BUY, px)
+                add_buys += 1
+                await asyncio.sleep(self.op_spacing_sec)
+
+            for px in need_sells:
+                if self.max_new_per_loop and add_sells >= self.max_new_per_loop:
+                    break
+                await self._place_order(OrderSide.SELL, px)
+                add_sells += 1
+                await asyncio.sleep(self.op_spacing_sec)
+
+            if not self.initialized:
+                self.initialized = True
+                logger.info("BIN: 初期配置完了 買い{}本 売り{}本", len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
             return
 
         # 初期配置後:
@@ -476,6 +547,9 @@ class GridEngine:
 
     async def _replenish_if_filled(self):
         """約定した注文を確認し、補充する"""
+        # BIN固定モードでは、約定イベントに依存せず ensure_grid が目標集合に揃えるためスキップ
+        if getattr(self, "bin_mode", False):
+            return
         try:
             active_orders = await self.adapter.list_active_orders(self.symbol)
             # EdgeXアダプタは dict を返すため堅牢にIDを抽出する

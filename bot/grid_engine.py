@@ -88,6 +88,12 @@ class GridEngine:
         except Exception:
             self.simple_mode = True
 
+        # 実注文の同期周期（ループ何回に1回か）。BINモードでの整合性確保用
+        try:
+            self.active_sync_every = int(os.getenv("EDGEX_GRID_ACTIVE_SYNC_EVERY", "3"))
+        except Exception:
+            self.active_sync_every = 3
+
         # ビン固定モード: 価格を N 刻みの絶対グリッドに揃える（例: 110000, 110100, 110200 ...）
         # ループ毎に現在価格から目標ビン集合を作り、差分で発注/取消のみ行う
         try:
@@ -167,6 +173,10 @@ class GridEngine:
                         sorted(self.placed_sell_px_to_id.keys()),
                     )
 
+                    # BINモード: 周期的に取引所のOPEN注文と突合（3ループに1回など）
+                    if self.bin_mode and getattr(self, "active_sync_every", 0) > 0 and (self._loop_iter % self.active_sync_every == 0):
+                        await self._sync_active_orders_from_exchange()
+
                     # グリッド配置
                     await self._ensure_grid(mid_price)
 
@@ -188,6 +198,59 @@ class GridEngine:
         finally:
             await self.adapter.close()
             logger.info("グリッドエンジン停止")
+
+    async def _sync_active_orders_from_exchange(self) -> None:
+        """取引所のOPEN注文を取得し、内部マップを実態に同期する（BIN用の軽量突合）。"""
+        try:
+            active_orders = await self.adapter.list_active_orders(self.symbol)
+        except Exception as e:
+            logger.debug("active sync skip: {}", e)
+            return
+
+        new_buys: Dict[float, str] = {}
+        new_sells: Dict[float, str] = {}
+
+        def _px(row: dict) -> float | None:
+            try:
+                raw = row.get("price") or row.get("px") or row.get("0")
+                return float(raw) if raw is not None else None
+            except Exception:
+                return None
+
+        def _oid(row: dict) -> str | None:
+            oid = (
+                row.get("orderId")
+                or row.get("id")
+                or row.get("order_id")
+                or row.get("clientOrderId")
+                or row.get("client_order_id")
+            )
+            return str(oid) if oid else None
+
+        for row in (active_orders or []):
+            if not isinstance(row, dict):
+                continue
+            # 状態/シンボル/サイド/価格
+            status = str(row.get("status") or "").upper()
+            if status and status != "OPEN":
+                continue
+            # 価格
+            px = _px(row)
+            if px is None:
+                continue
+            # サイド
+            side_str = str(row.get("side") or row.get("orderSide") or "").upper()
+            oid = _oid(row)
+            if not oid or not side_str:
+                continue
+            if side_str in ("BUY", "LONG"):
+                new_buys[px] = oid
+            elif side_str in ("SELL", "SHORT"):
+                new_sells[px] = oid
+
+        self.placed_buy_px_to_id = new_buys
+        self.placed_sell_px_to_id = new_sells
+        logger.debug("active sync: buy={} sell={}", len(new_buys), len(new_sells))
 
     async def _ensure_grid(self, mid_price: float):
         """

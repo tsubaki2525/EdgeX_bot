@@ -153,8 +153,49 @@ class GridEngine:
         if self.step <= 0:
             return
 
-        # 初期配置後はここで新規発注しない（以降は約定検知でアンカー補充のみ）
+        # 初期配置後:
+        # - 片側が全滅していたら、その片側だけ現在価格Pから再配置（挟み込みを回復）
+        # - 両側に1本以上あれば、ここでは新規発注しない（補充は約定側で行う）
         if self.initialized:
+            need_buy_seed = len(self.placed_buy_px_to_id) == 0
+            need_sell_seed = len(self.placed_sell_px_to_id) == 0
+            if not (need_buy_seed or need_sell_seed):
+                return
+            buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
+            sell_targets = [float(mid_price) + (self.first_offset + i * self.step) for i in range(self.levels)]
+            logger.info("再配置: need_buy={} need_sell={} P={} X={} N={}", need_buy_seed, need_sell_seed, mid_price, self.first_offset, self.step)
+            # BUY再種まき
+            if need_buy_seed:
+                new_buys = 0
+                for px in buy_targets:
+                    if px <= 0:
+                        continue
+                    if px >= (mid_price - 1e-9):
+                        continue
+                    if px in self.placed_buy_px_to_id:
+                        continue
+                    if not _has_min_gap(self.placed_buy_px_to_id, px):
+                        continue
+                    await self._place_order(OrderSide.BUY, px)
+                    new_buys += 1
+                    await asyncio.sleep(self.op_spacing_sec)
+                    if new_buys >= self.levels:
+                        break
+            # SELL再種まき
+            if need_sell_seed:
+                new_sells = 0
+                for px in sell_targets:
+                    if px <= (mid_price + 1e-9):
+                        continue
+                    if px in self.placed_sell_px_to_id:
+                        continue
+                    if not _has_min_gap(self.placed_sell_px_to_id, px):
+                        continue
+                    await self._place_order(OrderSide.SELL, px)
+                    new_sells += 1
+                    await asyncio.sleep(self.op_spacing_sec)
+                    if new_sells >= self.levels:
+                        break
             return
 
         def _has_min_gap(side_map: Dict[float, str], px: float) -> bool:
@@ -389,7 +430,7 @@ class GridEngine:
                     return str(row.get("orderId") or row.get("id") or row.get("order_id") or "")
                 # 未管理のOPEN注文
                 unknown = []
-                for row in (active or []):
+                for row in (active_orders or []):
                     if not isinstance(row, dict):
                         continue
                     oid = _oid(row)
